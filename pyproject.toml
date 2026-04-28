@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ocr-local"
+dynamic = ["version"]
+description = "Console OCR utility for local GLM-OCR inference."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[tool.setuptools.dynamic]
+version = { attr = "ocr_local.__version__" }
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["ocr_local*"]
+
+[tool.setuptools.package-data]
+"ocr_local.web" = ["static/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+  "integration: тяжелые тесты с реальной OCR-моделью",
+]

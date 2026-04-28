@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OCR Local</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <main class="app-shell">
+    <section class="image-pane">
+      <label id="dropZone" class="drop-zone" tabindex="0">
+        <input id="fileInput" type="file" accept=".jpg,.jpeg,.png,.webp,.bmp,image/*" hidden>
+        <div id="emptyState" class="empty-state">
+          <div class="upload-icon">+</div>
+          <div class="upload-title">Перетащите изображение</div>
+          <div class="upload-hint">или нажмите для выбора файла</div>
+        </div>
+        <img id="imagePreview" class="image-preview" alt="Загруженное изображение" hidden>
+      </label>
+    </section>
+    <section class="text-pane">
+      <header class="toolbar">
+        <div>
+          <div class="title">OCR Local</div>
+          <div id="statusText" class="status">Изображение не выбрано</div>
+        </div>
+        <button id="recognizeBtn" class="primary-button" type="button" disabled>Распознать</button>
+      </header>
+      <textarea id="resultText" class="result-text" spellcheck="false"></textarea>
+      <section class="log-panel">
+        <div class="log-header">
+          <span>Логи</span>
+          <button id="clearLogsBtn" class="ghost-button" type="button">Очистить</button>
+        </div>
+        <pre id="logConsole" class="log-console"></pre>
+      </section>
+    </section>
+  </main>
+  <script src="/static/app.js"></script>
+</body>
+</html>

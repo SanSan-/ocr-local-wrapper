@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+.idea/
+logs/
+models/
+resources/cache/
+resources/uploads/
+.env
+*.md
+ocr-local.code-workspace
