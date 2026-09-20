@@ -27,7 +27,7 @@ def validate_model_path(path: Path) -> Path:
     if not resolved.is_dir():
         raise OcrValidationError(f"Путь модели не является каталогом: {resolved}")
     required_files = ("config.json", "model.safetensors", "tokenizer.json")
-    missing = [name for name in required_files if not (resolved / name).exists()]
+    missing = [name for name in required_files if not (resolved / name).is_file()]
     if missing:
         raise OcrValidationError(
             f"В каталоге модели отсутствуют обязательные файлы: {', '.join(missing)}"

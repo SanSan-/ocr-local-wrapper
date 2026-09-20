@@ -14,7 +14,7 @@
         <div id="emptyState" class="empty-state">
           <div class="upload-icon">+</div>
           <div class="upload-title">Перетащите изображение</div>
-          <div class="upload-hint">или нажмите для выбора файла</div>
+          <div class="upload-hint">или нажмите для выбора файла<br>Ctrl+V — вставить изображение</div>
         </div>
         <img id="imagePreview" class="image-preview" alt="Загруженное изображение" hidden>
       </label>
@@ -27,6 +27,27 @@
         </div>
         <button id="recognizeBtn" class="primary-button" type="button" disabled>Распознать</button>
       </header>
+      <form id="modelSettings" class="model-settings" onsubmit="return false">
+        <label class="wide-field">Модель
+          <select id="modelSelect" aria-label="Модель"><option>Загрузка списка...</option></select>
+        </label>
+        <label class="wide-field">Промпт
+          <input id="promptInput" type="text" required aria-label="Промпт">
+        </label>
+        <label>Максимум новых токенов
+          <input id="maxTokensInput" type="number" min="1" max="32768" required>
+        </label>
+        <label>Максимум пикселей
+          <input id="maxPixelsInput" type="number" min="12544" max="16777216" step="1" required>
+        </label>
+        <label class="check-field"><input id="quantizationInput" type="checkbox"> INT8 — экономия памяти</label>
+        <label class="check-field"><input id="forceInput" type="checkbox"> Распознать заново</label>
+        <div class="settings-footer wide-field">
+          <span id="modelHint" class="status"></span>
+          <button id="resetSettingsBtn" class="ghost-button" type="button">Сбросить параметры</button>
+        </div>
+      </form>
+      <div id="metricsText" class="metrics" aria-live="polite"></div>
       <textarea id="resultText" class="result-text" spellcheck="false"></textarea>
       <section class="log-panel">
         <div class="log-header">

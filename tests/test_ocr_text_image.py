@@ -74,7 +74,7 @@ def test_run_ocr_processes_attached_text_image(tmp_path, monkeypatch):
 
     def fake_loader(path: Path, allow_quantization: bool, allow_cpu_fallback: bool) -> LoadedOcrModel:
         assert path == model_path
-        assert allow_quantization is True
+        assert allow_quantization is False
         assert allow_cpu_fallback is False
         return LoadedOcrModel(processor=processor, model=model, device="cpu", quantized=False)
 

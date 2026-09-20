@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 from PIL import Image
 
@@ -11,116 +13,126 @@ from ocr_local.utils import output_cache
 from ocr_local.web import app as web_app
 
 
-def test_web_index_loads() -> None:
-    client = TestClient(web_app.app)
-
-    response = client.get("/")
-
-    assert response.status_code == 200
-    assert "OCR Local" in response.text
-
-
-def test_web_app_js_supports_clipboard_paste() -> None:
-    client = TestClient(web_app.app)
-
-    response = client.get("/static/app.js")
-
-    assert response.status_code == 200
-    assert 'document.addEventListener("paste"' in response.text
-    assert "clipboardData" in response.text
-
-
-def test_upload_returns_cached_text_on_reupload(tmp_path, monkeypatch):
+@pytest.fixture
+def client(tmp_path, monkeypatch):
     monkeypatch.setattr(web_app, "UPLOADS_DIR", tmp_path / "uploads")
-    monkeypatch.setattr(output_cache, "OCR_CACHE_FILE", tmp_path / "ocr_cache.json")
-    client = TestClient(web_app.app)
-    image_bytes = _make_image_bytes(tmp_path / "sample.jpg")
-
-    first = client.post(
-        "/api/upload",
-        files={"file": ("sample.jpg", image_bytes, "image/jpeg")},
-    )
-    assert first.status_code == 200
-    image_path = Path(first.json()["image_path"])
-    output_cache.update_output_cache(
-        image_path,
-        image_path.with_suffix(".txt"),
-        "Текст из кеша",
-        web_app.logger,
-    )
-
-    second = client.post(
-        "/api/upload",
-        files={"file": ("sample.jpg", image_bytes, "image/jpeg")},
-    )
-
-    assert second.status_code == 200
-    payload = second.json()
-    assert payload["cached"] is True
-    assert payload["text"] == "Текст из кеша"
-
-
-def test_recognize_streams_text_and_logs(tmp_path, monkeypatch):
-    _reset_web_jobs()
-    upload_dir = tmp_path / "uploads"
-    monkeypatch.setattr(web_app, "UPLOADS_DIR", upload_dir)
-    monkeypatch.setattr(output_cache, "OCR_CACHE_FILE", tmp_path / "ocr_cache.json")
-    image_path = upload_dir / "image.jpg"
-    upload_dir.mkdir(parents=True)
-    image_path.write_bytes(_make_image_bytes(tmp_path / "source.jpg"))
-
-    def fake_run_ocr(options):
-        web_app.logger.info("Тестовый лог OCR.")
-        return OcrResult(
-            input_path=Path(options.input_path),
-            output_path=Path(options.output_path),
-            text="Распознанный текст",
-            device="cuda",
-            quantized=True,
-            cached=False,
-        )
-
-    monkeypatch.setattr(web_app, "run_ocr", fake_run_ocr)
-    client = TestClient(web_app.app)
-
-    response = client.post(
-        "/api/recognize",
-        json={"image_path": str(image_path), "force": False},
-    )
-
-    assert response.status_code == 200
-    job_id = response.json()["job_id"]
-    stream_response = client.get(f"/api/stream/{job_id}")
-    assert stream_response.status_code == 200
-    events = _parse_sse_events(stream_response.text)
-    done_event = events[-1]
-    result = done_event["result"]
-
-    assert any(
-        event.get("type") == "log" and "Тестовый лог OCR." in event.get("message", "")
-        for event in events
-    )
-    assert done_event["type"] == "done"
-    assert done_event["status"] == "ok"
-    assert result["text"] == "Распознанный текст"
-    assert result["cached"] is False
-    assert result["device"] == "cuda"
-
-
-def _make_image_bytes(path: Path) -> bytes:
-    image = Image.new("RGB", (32, 24), "white")
-    image.save(path, format="JPEG")
-    return path.read_bytes()
-
-
-def _parse_sse_events(body: str) -> list[dict[str, object]]:
-    events = []
-    for line in body.splitlines():
-        if line.startswith("data: "):
-            events.append(json.loads(line.removeprefix("data: ")))
-    return events
-
-
-def _reset_web_jobs() -> None:
+    monkeypatch.setattr(output_cache, "OCR_CACHE_FILE", tmp_path / "cache.json")
     web_app._jobs.clear()
+    web_app._active_job_id = None
+    web_app.logger.setLevel(logging.INFO)
+    with TestClient(web_app.app) as client:
+        yield client
+    for job in web_app._jobs.values():
+        if job.thread:
+            job.thread.join(timeout=3)
+
+
+def upload(client, tmp_path, model_id="glm-ocr"):
+    path = tmp_path / "source.png"
+    Image.new("RGB", (32, 24), "white").save(path)
+    response = client.post("/api/upload", files={"file": ("image.png", path.read_bytes(), "image/png")},
+                           data={"settings": json.dumps({"model_id": model_id})})
+    assert response.status_code == 200
+    return response.json()
+
+
+def events(client, job_id):
+    response = client.get(f"/api/stream/{job_id}")
+    assert response.status_code == 200
+    return [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith("data: ")]
+
+
+def test_startup_and_catalog_do_not_load_model(client, monkeypatch):
+    monkeypatch.setattr(web_app._model_pool, "get", lambda *args: pytest.fail("Не нужны веса"))
+    assert client.get("/").status_code == 200
+    assert client.get("/api/health").json()["status"] == "ok"
+    assert len(client.get("/api/models").json()["models"]) == 2
+    assert "clipboardData" in client.get("/static/app.js").text
+
+
+def test_upload_and_model_change_return_only_selected_cache(client, tmp_path):
+    first = upload(client, tmp_path)
+    image_path = Path(first["image_path"])
+    output_cache.update_output_cache(image_path, Path(first["output_path"]), "GLM result", web_app.logger,
+                                     settings=first["settings"])
+    second = upload(client, tmp_path)
+    assert second["cached"] and second["text"] == "GLM result"
+    paddle = client.post("/api/cached-result", json={
+        "image_path": first["image_path"], "model_id": "paddleocr-vl-1.6",
+    }).json()
+    assert not paddle["cached"] and paddle["text"] == ""
+    assert paddle["output_path"] != first["output_path"]
+    assert paddle["settings"]["prompt"] == "OCR:"
+
+
+def test_recognize_streams_selected_settings_text_metrics_and_logs(client, tmp_path, monkeypatch):
+    payload = upload(client, tmp_path, "paddleocr-vl-1.6")
+
+    def fake_run(options, *, loader):
+        assert options.model_id == "paddleocr-vl-1.6"
+        assert (options.prompt, options.max_new_tokens, options.max_pixels) == ("Custom:", 400, 500000)
+        assert options.allow_cpu_fallback is True
+        web_app.logger.info("Тестовый лог OCR.")
+        return OcrResult(options.input_path, options.output_path, "Распознанный текст", "cuda", False,
+                         model_id=options.model_id)
+    monkeypatch.setattr(web_app, "run_ocr", fake_run)
+    response = client.post("/api/recognize", json={
+        "image_path": payload["image_path"], "model_id": "paddleocr-vl-1.6",
+        "prompt": "Custom:", "max_new_tokens": 400, "max_pixels": 500000,
+    })
+    all_events = events(client, response.json()["job_id"])
+    assert any("Тестовый лог" in e.get("message", "") for e in all_events)
+    done = all_events[-1]
+    assert done["status"] == "ok"
+    assert done["result"]["text"] == "Распознанный текст"
+    assert "metrics" in done["result"] and done["elapsed_seconds"] >= 0
+    assert web_app._active_job_id is None
+
+
+@pytest.mark.parametrize("settings", [
+    {"model_id": "unknown"}, {"max_new_tokens": 0}, {"max_new_tokens": 1.5},
+    {"max_pixels": 1}, {"prompt": ""},
+])
+def test_bad_settings_rejected_before_job(client, tmp_path, settings):
+    uploaded = upload(client, tmp_path)
+    response = client.post("/api/recognize", json={"image_path": uploaded["image_path"], **settings})
+    assert response.status_code in (400, 422)
+    assert not web_app._jobs and web_app._active_job_id is None
+
+
+def test_thread_start_failure_releases_slot(client, tmp_path, monkeypatch):
+    uploaded = upload(client, tmp_path)
+
+    original_start = web_app.threading.Thread.start
+    def fail(self):
+        if self._target is web_app._run_recognition_job:
+            raise RuntimeError("start failure")
+        return original_start(self)
+    monkeypatch.setattr(web_app.threading.Thread, "start", fail)
+    # ASGI TestClient уже запущен контекстным менеджером.
+    response = client.post("/api/recognize", json={"image_path": uploaded["image_path"]})
+    assert response.status_code == 500
+    assert web_app._active_job_id is None and not web_app._jobs
+
+
+def test_error_done_releases_slot_and_keeps_output_absent(client, tmp_path, monkeypatch):
+    uploaded = upload(client, tmp_path)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("test GPU failure")
+    monkeypatch.setattr(web_app, "run_ocr", fail)
+    response = client.post("/api/recognize", json={"image_path": uploaded["image_path"]})
+    done = events(client, response.json()["job_id"])[-1]
+    assert done["status"] == "error" and "test GPU failure" in done["error"]
+    assert web_app._active_job_id is None
+    assert not Path(uploaded["output_path"]).exists()
+
+
+def test_rejects_outside_uploads_and_active_job(client, tmp_path):
+    outside = tmp_path / "outside.png"
+    Image.new("RGB", (20, 20)).save(outside)
+    assert client.post("/api/recognize", json={"image_path": str(outside)}).status_code == 400
+    uploaded = upload(client, tmp_path)
+    web_app._active_job_id = "other-job"
+    assert client.post("/api/recognize", json={"image_path": uploaded["image_path"]}).status_code == 409
     web_app._active_job_id = None

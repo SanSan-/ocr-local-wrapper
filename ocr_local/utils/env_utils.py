@@ -15,7 +15,7 @@ def load_environment(env_path: Path | None = None) -> bool:
         from dotenv import load_dotenv
     except ImportError:
         return False
-    return bool(load_dotenv(path, override=False))
+    return bool(load_dotenv(path, override=False, encoding="utf-8"))
 
 
 def get_default_model_path() -> Path:
