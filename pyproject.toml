@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "ocr-local"
 dynamic = ["version"]
-description = "Console OCR utility for local GLM-OCR inference."
+description = "Local GLM-OCR and PaddleOCR-VL inference with CLI and web UI."
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = []

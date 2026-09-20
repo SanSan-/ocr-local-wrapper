@@ -4,19 +4,19 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ocr_local.constants import DEFAULT_MAX_NEW_TOKENS, DEFAULT_MODEL_PATH, DEFAULT_PROMPT
-
 
 @dataclass(frozen=True)
 class OcrOptions:
-    """Настройки запуска OCR."""
+    """Настройки запуска; пропущенные параметры берутся из профиля."""
 
     input_path: Path
     output_path: Path | None = None
-    model_path: Path = field(default_factory=lambda: DEFAULT_MODEL_PATH)
-    prompt: str = DEFAULT_PROMPT
-    max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS
-    quantization_enabled: bool = True
+    model_path: Path | None = None
+    model_id: str | None = None
+    prompt: str | None = None
+    max_new_tokens: int | None = None
+    max_pixels: int | None = None
+    quantization_enabled: bool = False
     allow_cpu_fallback: bool = False
     force: bool = False
     verbose: bool = False
@@ -30,11 +30,25 @@ class LoadedOcrModel:
     model: Any
     device: Any
     quantized: bool
+    model_path: Path | None = None
+
+
+@dataclass
+class OcrMetrics:
+    """Измеренные стадии OCR в секундах."""
+
+    load_seconds: float = 0.0
+    prepare_seconds: float = 0.0
+    generate_seconds: float = 0.0
+    total_seconds: float = 0.0
+    generated_tokens: int = 0
+    tokens_per_second: float = 0.0
+    limit_reached: bool = False
 
 
 @dataclass(frozen=True)
 class OcrResult:
-    """Результат OCR."""
+    """Результат OCR с настройками и измерениями."""
 
     input_path: Path
     output_path: Path
@@ -42,3 +56,6 @@ class OcrResult:
     device: str
     quantized: bool
     cached: bool = False
+    model_id: str = ""
+    settings: dict[str, object] = field(default_factory=dict)
+    metrics: OcrMetrics = field(default_factory=OcrMetrics)
