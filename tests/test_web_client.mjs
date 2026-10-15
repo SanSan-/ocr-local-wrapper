@@ -34,12 +34,14 @@ function element() {
     replaceChildren(...children) {this.children = children;},
     reportValidity() {this.reports = (this.reports || 0) + 1; return this.valid;},
     checkValidity() {return this.valid;},
+    set innerHTML(value) {throw new Error("Разметка не должна исполняться: " + value);},
+    insertAdjacentHTML() {throw new Error("Разметка не должна исполняться");},
     click() {this.emit("click", {target: this});},
     classList: {add() {}, remove() {}},
   };
 }
 
-async function client({models = () => json(catalog), upload} = {}) {
+async function client({models = () => json(catalog), upload, recognize, cached} = {}) {
   const elements = new Map();
   const document = element();
   document.getElementById = id => {
@@ -53,9 +55,10 @@ async function client({models = () => json(catalog), upload} = {}) {
   const calls = [];
   const streams = [];
   const context = vm.createContext({
-    document, File, FormData,
+    document, File, FormData, TextEncoder,
     EventSource: class {
-      constructor() {streams.push(this);}
+      static CLOSED = 2;
+      constructor(url, options) {this.url = url; this.options = options; streams.push(this);}
       close() {this.closed = true;}
     },
     fetch: async (url, options = {}) => {
@@ -63,12 +66,12 @@ async function client({models = () => json(catalog), upload} = {}) {
       if (url === "/api/models") return models();
       if (url === "/api/upload") {
         return upload ? upload(options) : json({
-          image_path: "/uploads/image.png", image_url: "/api/image/image.png",
+          upload_id: "image-id.png", image_url: "/api/image/image.png",
           text: "", cached: false,
         });
       }
-      if (url === "/api/recognize") return json({job_id: "test-job"});
-      if (url === "/api/cached-result") return json({cached: false, text: ""});
+      if (url === "/api/recognize") return recognize ? recognize(options) : json({job_id: "test-job"});
+      if (url === "/api/cached-result") return cached ? cached(options) : json({cached: false, text: ""});
       throw new Error("Неожиданный запрос: " + url);
     },
   });
@@ -171,7 +174,7 @@ test("Повторная вставка во время upload не создаё
   c.paste([imageItem("image/jpeg")]);
   assert.equal(c.uploads().length, 1);
   assert.equal(c.el("statusText").textContent, "Загрузка изображения...");
-  pending.resolve(json({image_path: "/first.png", image_url: "/first.png", text: ""}));
+  pending.resolve(json({upload_id: "first-id.png", image_url: "/first.png", text: ""}));
   await settle();
   assert.equal(c.el("imagePreview").src, "/first.png");
 });
@@ -195,7 +198,7 @@ test("Вставка во время OCR не меняет изображени�
 test("Смена модели и повторная вставка используют только кеш новых настроек", async () => {
   const c = await client({upload: options => {
     const settings = JSON.parse(options.body.get("settings"));
-    return json({image_path: "/image.png", image_url: "/image.png", cached: true, text: settings.model_id});
+    return json({upload_id: "image-id.png", image_url: "/image.png", cached: true, text: settings.model_id});
   }});
   c.paste([imageItem()]);
   await settle();
@@ -226,7 +229,7 @@ test("Ошибка upload сохраняет прежнее изображени
   let fail = true;
   const c = await client({upload: () => {
     if (fail) return json({detail: "Тестовый отказ"}, 400);
-    return json({image_path: "/retry.png", image_url: "/retry.png", text: ""});
+    return json({upload_id: "retry-id.png", image_url: "/retry.png", text: ""});
   }});
   c.el("imagePreview").src = "/previous.png";
   c.paste([imageItem()]);
@@ -238,4 +241,308 @@ test("Ошибка upload сохраняет прежнее изображени
   await settle();
   assert.equal(c.uploads().length, 2);
   assert.equal(c.el("imagePreview").src, "/retry.png");
+});
+
+for (const prompt of ["   ", "\t\n", "\u00a0\u2003", "\u0085", "\u001c\u001d\u001e\u001f"]) {
+  test("Пробельный промпт блокирует все запросы и исправление восстанавливает работу: " + JSON.stringify(prompt), async () => {
+    const c = await client();
+    c.paste([imageItem()]);
+    await settle();
+    c.el("promptInput").value = prompt;
+    c.el("resultText").value = "Прежний результат";
+    const preview = c.el("imagePreview").src;
+    const requests = c.calls.length;
+    c.el("promptInput").emit("change");
+    c.el("recognizeBtn").click();
+    c.paste([imageItem()]);
+    c.el("fileInput").files = [new File(["choose"], "choose.png", {type: "image/png"})];
+    c.el("fileInput").emit("change");
+    c.el("dropZone").emit("drop", {dataTransfer: {files: [new File(["drop"], "drop.png", {type: "image/png"})]}});
+    await settle();
+    assert.equal(c.calls.length, requests);
+    assert.equal(c.el("promptInput").value, prompt);
+    assert.equal(c.el("resultText").value, "Прежний результат");
+    assert.equal(c.el("imagePreview").src, preview);
+    assert.match(c.el("statusText").textContent, /промпт/i);
+    c.el("promptInput").value = "  Ручной промпт  ";
+    c.el("promptInput").emit("input");
+    c.el("promptInput").emit("change");
+    await settle();
+    c.paste([imageItem()]);
+    await settle();
+    assert.equal(c.uploads().length, 2);
+    assert.equal(JSON.parse(c.uploads()[1].body.get("settings")).prompt, "  Ручной промпт  ");
+    assert.equal(c.calls.filter(call => call.url === "/api/cached-result").length, 1);
+    c.el("recognizeBtn").click();
+    await settle();
+    assert.equal(c.calls.filter(call => call.url === "/api/recognize").length, 1);
+  });
+}
+
+for (const status of ["ok", "error"]) {
+  test("Разрыв SSE сохраняет блокировку до done/" + status + " текущей задачи", async () => {
+    const c = await client();
+    c.paste([imageItem()]);
+    await settle();
+    c.el("recognizeBtn").click();
+    await settle();
+    const stream = c.streams[0];
+    const preview = c.el("imagePreview").src;
+    stream.readyState = 0;
+    stream.onerror();
+    assert.notEqual(stream.closed, true);
+    assert.equal(c.el("recognizeBtn").disabled, true);
+    assert.equal(c.el("fileInput").disabled, true);
+    assert.ok(c.el("modelSettings").elements.every(control => control.disabled));
+    c.paste([imageItem()]);
+    c.el("dropZone").emit("drop", {dataTransfer: {files: [new File(["next"], "next.png", {type: "image/png"})]}});
+    c.el("recognizeBtn").click();
+    await settle();
+    assert.equal(c.uploads().length, 1);
+    assert.equal(c.calls.filter(call => call.url === "/api/recognize").length, 1);
+    assert.equal(c.el("imagePreview").src, preview);
+    stream.onopen();
+    const done = status === "ok"
+      ? {type: "done", status, result: {text: "Готово", model_id: "paddleocr-vl-1.6", metrics: {}}, elapsed_seconds: 1}
+      : {type: "done", status, error: "Проверочный отказ"};
+    stream.onmessage({data: JSON.stringify(done)});
+    assert.equal(c.el("recognizeBtn").disabled, false);
+    assert.equal(c.el("fileInput").disabled, false);
+    assert.ok(c.el("modelSettings").elements.every(control => !control.disabled));
+    assert.equal(stream.closed, true);
+    assert.match(c.el("statusText").textContent, status === "ok" ? /завершено/ : /Проверочный отказ/);
+    c.el("recognizeBtn").click();
+    await settle();
+    const currentStatus = c.el("statusText").textContent;
+    stream.onerror();
+    stream.onopen();
+    stream.onmessage({data: JSON.stringify(done)});
+    assert.equal(c.el("recognizeBtn").disabled, true);
+    assert.equal(c.el("fileInput").disabled, true);
+    assert.equal(c.el("statusText").textContent, currentStatus);
+    assert.notEqual(c.streams[1].closed, true);
+  });
+}
+
+test("Закрытый SSE сообщает неизвестное состояние и не снимает блокировку", async () => {
+  const c = await client();
+  c.paste([imageItem()]);
+  await settle();
+  c.el("recognizeBtn").click();
+  await settle();
+  c.streams[0].readyState = 2;
+  c.streams[0].onerror();
+  assert.equal(c.el("recognizeBtn").disabled, true);
+  assert.equal(c.el("fileInput").disabled, true);
+  assert.match(c.el("statusText").textContent, /состояние задачи неизвестно/i);
+  assert.match(c.el("statusText").textContent, /обновите страницу/i);
+});
+
+test("Нативная проверка пределов сохраняется при корректном промпте", async () => {
+  const c = await client();
+  c.paste([imageItem()]);
+  await settle();
+  c.el("promptInput").value = "OCR:";
+  c.el("modelSettings").valid = false;
+  c.el("maxTokensInput").value = "0";
+  const requests = c.calls.length;
+  c.el("maxTokensInput").emit("change");
+  c.el("recognizeBtn").click();
+  c.paste([imageItem()]);
+  await settle();
+  assert.equal(c.calls.length, requests);
+  assert.match(c.el("statusText").textContent, /Исправьте параметры модели/);
+  assert.equal(c.el("maxTokensInput").value, "0");
+});
+
+test("U+FEFF сохраняется как непробельный символ по серверному контракту", async () => {
+  const c = await client();
+  c.el("promptInput").value = "\ufeff";
+  c.paste([imageItem()]);
+  await settle();
+  assert.equal(c.uploads().length, 1);
+  assert.equal(JSON.parse(c.uploads()[0].body.get("settings")).prompt, "\ufeff");
+});
+
+test("Распознавание и кеш используют upload_id; штатный EventSource не передаёт секрет в URL", async () => {
+  const c = await client();
+  c.paste([imageItem()]);
+  await settle();
+  c.el("promptInput").emit("change");
+  await settle();
+  c.el("recognizeBtn").click();
+  await settle();
+  for (const call of c.calls.filter(call => ["/api/recognize", "/api/cached-result"].includes(call.url))) {
+    const body = JSON.parse(call.body);
+    assert.equal(body.upload_id, "image-id.png");
+    assert.equal("image_path" in body, false);
+    assert.equal("model_path" in body, false);
+    assert.equal("output_path" in body, false);
+  }
+  assert.equal(c.streams.length, 1);
+  assert.equal(c.streams[0].url, "/api/stream/test-job");
+  assert.equal(c.streams[0].options, undefined);
+  assert.equal(c.calls.some(call => call.url.includes("?")), false);
+});
+
+test("Недоступная модель объясняется без чтения или показа серверного пути", async () => {
+  const publicCatalog = structuredClone(catalog);
+  for (const model of publicCatalog.models) {
+    model.available = false;
+    Object.defineProperty(model, "path", {get() {throw new Error("Внутренний путь недоступен клиенту");}});
+  }
+  const c = await client({models: () => ({ok: true, json: async () => publicCatalog})});
+  assert.match(c.el("modelHint").textContent, /PaddleOCR-VL-1\.6 недоступна/);
+  assert.match(c.el("modelHint").textContent, /локальную настройку/);
+  assert.equal(c.el("modelHint").title, undefined);
+  c.el("modelSelect").value = "glm-ocr";
+  c.el("modelSelect").emit("change");
+  assert.match(c.el("modelHint").textContent, /GLM-OCR недоступна/);
+});
+
+for (const [character, bytes] of [["a", 1], ["я", 2], ["😀", 4]]) {
+  test("Предел промпта считается в UTF-8, включая границу 8 КиБ: " + character, async () => {
+    const c = await client();
+    const boundary = character.repeat(8192 / bytes);
+    c.el("promptInput").value = boundary;
+    c.paste([imageItem()]);
+    await settle();
+    assert.equal(c.uploads().length, 1);
+    assert.equal(JSON.parse(c.uploads()[0].body.get("settings")).prompt, boundary);
+    c.el("promptInput").value = boundary + "a";
+    c.el("resultText").value = "Прежний результат";
+    const preview = c.el("imagePreview").src;
+    const requests = c.calls.length;
+    c.el("promptInput").emit("change");
+    c.el("recognizeBtn").click();
+    c.paste([imageItem()]);
+    await settle();
+    assert.equal(c.calls.length, requests);
+    assert.match(c.el("statusText").textContent, /8 КиБ.*UTF-8/);
+    assert.equal(c.el("promptInput").value, boundary + "a");
+    assert.equal(c.el("resultText").value, "Прежний результат");
+    assert.equal(c.el("imagePreview").src, preview);
+    c.el("promptInput").value = "  Допустимый промпт  ";
+    c.paste([imageItem()]);
+    await settle();
+    assert.equal(c.uploads().length, 2);
+    assert.equal(JSON.parse(c.uploads()[1].body.get("settings")).prompt, "  Допустимый промпт  ");
+  });
+}
+
+test("Лимит файла 25 МиБ действует для вставки, выбора и перетаскивания до запроса", async () => {
+  const c = await client();
+  c.paste([imageItem()]);
+  await settle();
+  const preview = c.el("imagePreview").src;
+  c.el("resultText").value = "Прежний текст";
+  c.el("promptInput").value = "Ручной промпт";
+  const oversized = new File([new Uint8Array(25 * 1024 * 1024 + 1)], "large.png", {type: "image/png"});
+  c.paste([{kind: "file", type: "image/png", getAsFile: () => oversized}]);
+  c.el("fileInput").files = [oversized];
+  c.el("fileInput").emit("change");
+  c.el("dropZone").emit("drop", {dataTransfer: {files: [oversized]}});
+  await settle();
+  assert.equal(c.uploads().length, 1);
+  assert.match(c.el("statusText").textContent, /25 МиБ/);
+  assert.equal(c.el("imagePreview").src, preview);
+  assert.equal(c.el("resultText").value, "Прежний текст");
+  assert.equal(c.el("promptInput").value, "Ручной промпт");
+  assert.equal(c.el("recognizeBtn").disabled, false);
+  c.el("fileInput").files = [new File([oversized.slice(0, 25 * 1024 * 1024)], "boundary.png", {type: "image/png"})];
+  c.el("fileInput").emit("change");
+  await settle();
+  assert.equal(c.uploads().length, 2);
+  assert.equal(c.uploads()[1].body.get("file").size, 25 * 1024 * 1024);
+});
+
+for (const [status, code, detail] of [
+  [413, "upload_too_large", "Изображение превышает допустимый размер."],
+  [429, "upload_busy", "Другая загрузка ещё выполняется."],
+  [507, "storage_quota_exceeded", "Недостаточно места. Освободите место вручную."],
+]) {
+  test("Отказ upload " + status + " сохраняет изображение, результат, настройки и прежний upload_id", async () => {
+    let uploads = 0;
+    const c = await client({upload: () => {
+      if (++uploads === 1) return json({upload_id: "preserved-id.png", image_url: "/api/image/preserved-id.png", text: "Прежний текст", cached: true});
+      return Response.json({detail, code, diagnostic_id: "diag-upload"}, {status, headers: {"Retry-After": "12"}});
+    }});
+    c.paste([imageItem()]);
+    await settle();
+    c.el("promptInput").value = "Ручной промпт";
+    c.el("maxTokensInput").value = "128";
+    c.el("maxPixelsInput").value = "200000";
+    c.el("quantizationInput").checked = true;
+    c.el("forceInput").checked = true;
+    c.el("metricsText").textContent = "Прежние метрики";
+    const preview = c.el("imagePreview").src;
+    c.paste([imageItem("image/jpeg")]);
+    await settle();
+    assert.equal(c.el("imagePreview").src, preview);
+    assert.equal(c.el("resultText").value, "Прежний текст");
+    assert.equal(c.el("metricsText").textContent, "Прежние метрики");
+    assert.equal(c.el("promptInput").value, "Ручной промпт");
+    assert.equal(c.el("maxTokensInput").value, "128");
+    assert.equal(c.el("maxPixelsInput").value, "200000");
+    assert.equal(c.el("quantizationInput").checked, true);
+    assert.equal(c.el("forceInput").checked, true);
+    assert.equal(c.el("recognizeBtn").disabled, false);
+    assert.ok(c.el("statusText").textContent.includes(detail));
+    assert.ok(c.el("statusText").textContent.includes(code));
+    assert.match(c.el("logConsole").textContent, /diag-upload/);
+    if (status === 429) assert.match(c.el("statusText").textContent, /через 12 с/);
+    c.el("recognizeBtn").click();
+    await settle();
+    const body = JSON.parse(c.calls.find(call => call.url === "/api/recognize").body);
+    assert.equal(body.upload_id, "preserved-id.png");
+    assert.equal(body.prompt, "Ручной промпт");
+    assert.equal(body.force, true);
+  });
+}
+
+test("HTTP и SSE показывают безопасную диагностику как текст, результат не исполняет разметку", async () => {
+  const markup = '<img src=x onerror="alert(1)">';
+  const c = await client();
+  c.paste([imageItem()]);
+  await settle();
+  c.el("recognizeBtn").click();
+  await settle();
+  c.streams[0].onmessage({data: JSON.stringify({type: "log", message: markup})});
+  c.streams[0].onmessage({data: JSON.stringify({type: "done", status: "ok", result: {
+    text: markup, model_id: "paddleocr-vl-1.6", metrics: {},
+  }, elapsed_seconds: 1})});
+  assert.equal(c.el("resultText").value, markup);
+  assert.ok(c.el("logConsole").textContent.includes(markup));
+  c.el("recognizeBtn").click();
+  await settle();
+  c.streams[1].onmessage({data: JSON.stringify({type: "done", status: "error", error: markup,
+    code: "result_too_large", diagnostic_id: "diag-sse"})});
+  assert.equal(c.el("resultText").value, markup);
+  assert.ok(c.el("statusText").textContent.includes(markup));
+  assert.match(c.el("logConsole").textContent, /result_too_large.*diag-sse/);
+  assert.equal(c.el("recognizeBtn").disabled, false);
+  const failed = await client({upload: () => json({detail: markup, code: "invalid_image", diagnostic_id: "diag-http"}, 400)});
+  failed.paste([imageItem()]);
+  await settle();
+  assert.ok(failed.el("statusText").textContent.includes(markup));
+  assert.match(failed.el("logConsole").textContent, /invalid_image.*diag-http/);
+});
+
+test("Ответ без публичной ошибки не отражает техническое тело или statusText", async () => {
+  const c = await client({upload: () => new Response("Traceback C:\\private\\file.py", {
+    status: 500, statusText: "Internal path C:\\private\\file.py",
+  })});
+  c.paste([imageItem()]);
+  await settle();
+  assert.match(c.el("statusText").textContent, /Не удалось выполнить запрос/);
+  assert.doesNotMatch(c.el("statusText").textContent, /Traceback|private/);
+  assert.doesNotMatch(c.el("logConsole").textContent, /Traceback|private/);
+});
+
+test("Отправка формы отменяется внешним обработчиком без перезагрузки и запросов", async () => {
+  const c = await client();
+  const requests = c.calls.length;
+  assert.equal(c.el("modelSettings").emit("submit").defaultPrevented, true);
+  await settle();
+  assert.equal(c.calls.length, requests);
 });

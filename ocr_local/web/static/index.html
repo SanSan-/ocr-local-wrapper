@@ -14,7 +14,7 @@
         <div id="emptyState" class="empty-state">
           <div class="upload-icon">+</div>
           <div class="upload-title">Перетащите изображение</div>
-          <div class="upload-hint">или нажмите для выбора файла<br>Ctrl+V — вставить изображение</div>
+          <div class="upload-hint">или нажмите для выбора файла<br>Ctrl+V — вставить изображение<br>Файл размером до 25 МиБ</div>
         </div>
         <img id="imagePreview" class="image-preview" alt="Загруженное изображение" hidden>
       </label>
@@ -27,12 +27,13 @@
         </div>
         <button id="recognizeBtn" class="primary-button" type="button" disabled>Распознать</button>
       </header>
-      <form id="modelSettings" class="model-settings" onsubmit="return false">
+      <form id="modelSettings" class="model-settings">
         <label class="wide-field">Модель
           <select id="modelSelect" aria-label="Модель"><option>Загрузка списка...</option></select>
         </label>
         <label class="wide-field">Промпт
-          <input id="promptInput" type="text" required aria-label="Промпт">
+          <input id="promptInput" type="text" required aria-label="Промпт" aria-describedby="promptLimitHint">
+          <span id="promptLimitHint" class="status">До 8 КиБ текста в кодировке UTF-8.</span>
         </label>
         <label>Максимум новых токенов
           <input id="maxTokensInput" type="number" min="1" max="32768" required>
@@ -47,6 +48,8 @@
           <button id="resetSettingsBtn" class="ghost-button" type="button">Сбросить параметры</button>
         </div>
       </form>
+      <div id="recoveryHint" class="metrics">После завершения результат доступен для восстановления связи в течение 30 минут.
+        Уже показанный текст и сохранённые файлы остаются. После перезапуска приложения обновите страницу.</div>
       <div id="metricsText" class="metrics" aria-live="polite"></div>
       <textarea id="resultText" class="result-text" spellcheck="false"></textarea>
       <section class="log-panel">

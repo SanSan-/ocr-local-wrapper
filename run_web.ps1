@@ -6,11 +6,21 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ($HostAddress -cne "127.0.0.1" -and $HostAddress -cne "::1") {
+    throw "Only the loopback addresses 127.0.0.1 and ::1 are supported."
+}
+if ($Port -lt 1 -or $Port -gt 65535) {
+    throw "Port must be between 1 and 65535."
+}
+if ($Reload) {
+    throw "Reload is not supported: the local session requires one stable process."
+}
+
 $ProjectRoot = Split-Path -Parent $PSCommandPath
 $PythonPath = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 $displayHost = $HostAddress
-if ($displayHost -eq "0.0.0.0") {
-    $displayHost = "127.0.0.1"
+if ($displayHost -eq "::1") {
+    $displayHost = "[::1]"
 }
 $serviceUrl = "http://${displayHost}:$Port"
 
@@ -36,17 +46,12 @@ Set-Location -LiteralPath $ProjectRoot
 $arguments = @(
     "-B",
     "-m",
-    "uvicorn",
-    "ocr_local.web.app:app",
+    "ocr_local.web",
     "--host",
     $HostAddress,
     "--port",
     $Port.ToString()
 )
-
-if ($Reload) {
-    $arguments += "--reload"
-}
 
 Write-Host "OCR Local web: $serviceUrl"
 & $PythonPath @arguments

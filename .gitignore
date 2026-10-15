@@ -11,6 +11,7 @@ resources/uploads/
 .env
 *.md
 !AGENTS.md
+!CHANGELOG.md
 !**/openspec/**/*.md
 sonar-project.properties
 **/evidence/**

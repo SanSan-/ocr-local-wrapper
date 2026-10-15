@@ -4,11 +4,21 @@ import hashlib
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from ocr_local.constants import OCR_CACHE_FILE
-from ocr_local.models import OcrMetrics
+from ocr_local.models import OcrMetrics, OcrResult
 from ocr_local.utils.io_utils import read_text_utf8, write_text_utf8_no_bom
+
+
+class StoragePolicy(Protocol):
+    """Необязательный допуск хранения, независимый от способа вызова OCR."""
+
+    def load_cache(self) -> dict[str, Any]: ...
+
+    def restore_result(self, result: OcrResult) -> None: ...
+
+    def save_result(self, result: OcrResult) -> None: ...
 
 
 def build_cache_key(input_path: Path, settings: dict[str, object] | None = None) -> str:
@@ -52,15 +62,16 @@ def get_cached_text(
 def apply_output_cache(
     input_path: Path, output_path: Path, logger: logging.Logger, *,
     settings: dict[str, object] | None = None, metrics: OcrMetrics | None = None,
+    cache: dict[str, Any] | None = None, restore: bool = True,
 ) -> str | None:
     """Возвращает только совпавший кеш; готовый TXT не доказывает модель/параметры."""
-    cache = load_cache_snapshot(logger)
+    cache = load_cache_snapshot(logger) if cache is None else cache
     text = get_cached_text(cache, input_path, settings=settings)
     if text is None:
         return None
     if output_path.is_dir():
         return None
-    if not output_path.exists():
+    if restore and not output_path.exists():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         write_text_utf8_no_bom(output_path, text)
     if metrics is not None:
@@ -76,14 +87,26 @@ def update_output_cache(
 ) -> None:
     """Добавляет запись, сохраняя прежние ключи и результаты."""
     cache = load_cache_snapshot(logger)
+    serialized = serialize_cache_update(
+        cache, input_path, output_path, text, settings=settings, limit_reached=limit_reached,
+    )
+    try:
+        OCR_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        OCR_CACHE_FILE.write_text(serialized, encoding="utf-8")
+    except OSError as exc:
+        logger.warning("Не удалось сохранить кеш OCR: %s", exc)
+
+
+def serialize_cache_update(
+    cache: dict[str, Any], input_path: Path, output_path: Path, text: str, *,
+    settings: dict[str, object] | None = None, limit_reached: bool = False,
+) -> str:
+    """Готовит точное содержимое общего кеша, сохраняя остальные записи."""
+    updated = dict(cache)
     stat = input_path.stat()
-    cache[build_cache_key(input_path, settings)] = {
+    updated[build_cache_key(input_path, settings)] = {
         "input_path": str(input_path), "output_path": str(output_path),
         "input_size": stat.st_size, "input_mtime_ns": stat.st_mtime_ns,
         "settings": settings, "text": text, "limit_reached": limit_reached,
     }
-    try:
-        OCR_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
-        OCR_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
-    except OSError as exc:
-        logger.warning("Не удалось сохранить кеш OCR: %s", exc)
+    return json.dumps(updated, ensure_ascii=False, indent=2)

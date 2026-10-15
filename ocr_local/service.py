@@ -15,7 +15,7 @@ from ocr_local.utils.io_utils import (
 from ocr_local.utils.model_utils import (
     inference_context, load_model_components, synchronize_device,
 )
-from ocr_local.utils.output_cache import apply_output_cache, update_output_cache
+from ocr_local.utils.output_cache import StoragePolicy, apply_output_cache, update_output_cache
 
 logger = logging.getLogger(__name__)
 ModelLoader = Callable[[Path, bool, bool], LoadedOcrModel]
@@ -28,6 +28,7 @@ SPECIAL_TOKENS = (
 def run_ocr(
     options: OcrOptions, *, loaded: LoadedOcrModel | None = None,
     loader: ModelLoader = load_model_components,
+    storage_policy: StoragePolicy | None = None,
 ) -> OcrResult:
     """Выполняет общий OCR: валидация → профильный кеш → модель → TXT."""
     started = time.perf_counter()
@@ -37,11 +38,18 @@ def run_ocr(
     output_path = build_output_path(input_path, options.output_path)
     settings = settings_identity(options)
     if not options.force:
-        text = apply_output_cache(input_path, output_path, logger, settings=settings, metrics=metrics)
+        text = apply_output_cache(
+            input_path, output_path, logger, settings=settings, metrics=metrics,
+            cache=storage_policy.load_cache() if storage_policy is not None else None,
+            restore=storage_policy is None,
+        )
         if text is not None:
             metrics.total_seconds = time.perf_counter() - started
-            return OcrResult(input_path, output_path, text, "cache", False, True,
-                             options.model_id, settings, metrics)
+            result = OcrResult(input_path, output_path, text, "cache", False, True,
+                               options.model_id, settings, metrics)
+            if storage_policy is not None:
+                storage_policy.restore_result(result)
+            return result
     ensure_output_can_be_written(output_path, options.force)
     load_started = time.perf_counter()
     if loaded is None:
@@ -52,14 +60,19 @@ def run_ocr(
     synchronize_device(loaded.device)
     metrics.load_seconds = time.perf_counter() - load_started
     text = recognize_image_text(input_path, options, loaded, metrics=metrics)
-    write_text_utf8_no_bom(output_path, text)
-    update_output_cache(input_path, output_path, text, logger, settings=settings, limit_reached=metrics.limit_reached)
     metrics.total_seconds = time.perf_counter() - started
+    result = OcrResult(input_path, output_path, text, _device_label(loaded.device),
+                       loaded.quantized, False, options.model_id, settings, metrics)
+    if storage_policy is None:
+        write_text_utf8_no_bom(output_path, text)
+        update_output_cache(input_path, output_path, text, logger, settings=settings, limit_reached=metrics.limit_reached)
+        metrics.total_seconds = time.perf_counter() - started
+    else:
+        storage_policy.save_result(result)
     logger.info("Время: загрузка %.3f с, подготовка %.3f с, генерация %.3f с; %d токенов, %.1f токен/с.",
                 metrics.load_seconds, metrics.prepare_seconds, metrics.generate_seconds,
                 metrics.generated_tokens, metrics.tokens_per_second)
-    return OcrResult(input_path, output_path, text, _device_label(loaded.device),
-                     loaded.quantized, False, options.model_id, settings, metrics)
+    return result
 
 
 def recognize_image_text(

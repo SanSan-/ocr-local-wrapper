@@ -14,7 +14,10 @@ const maxTokensInput = $("maxTokensInput");
 const maxPixelsInput = $("maxPixelsInput");
 const quantizationInput = $("quantizationInput");
 const forceInput = $("forceInput");
-const state = {imagePath: null, jobId: null, stream: null, busy: false, ready: false, models: [], modelsError: "", revision: 0};
+const MAX_UPLOAD_BYTES = 25 * 1024 * 1024;
+const MAX_PROMPT_BYTES = 8 * 1024;
+const utf8 = new TextEncoder();
+const state = {uploadId: null, jobId: null, stream: null, busy: false, ready: false, models: [], modelsError: "", revision: 0};
 
 function setStatus(text) { $("statusText").textContent = text; }
 
@@ -26,7 +29,7 @@ function appendLog(text) {
 
 function setBusy(busy) {
   state.busy = busy;
-  recognizeBtn.disabled = busy || !state.imagePath || !state.ready;
+  recognizeBtn.disabled = busy || !state.uploadId || !state.ready;
   recognizeBtn.textContent = state.jobId ? "Распознаётся..." : "Распознать";
   for (const control of settingsForm.elements) control.disabled = busy || !state.ready;
   fileInput.disabled = busy || !state.ready;
@@ -49,8 +52,9 @@ function applyDefaults() {
   maxPixelsInput.value = model.max_pixels;
   maxPixelsInput.min = model.min_pixels;
   quantizationInput.checked = false;
-  $("modelHint").textContent = model.available ? "Модель доступна локально" : "Файлы модели не найдены";
-  $("modelHint").title = model.path;
+  $("modelHint").textContent = model.available
+    ? "Модель доступна локально"
+    : "Модель " + model.name + " недоступна. Проверьте её локальную настройку.";
   invalidateResult();
 }
 
@@ -58,7 +62,7 @@ function invalidateResult() {
   state.revision++;
   resultText.value = "";
   $("metricsText").textContent = "";
-  if (state.imagePath) setStatus("Настройки изменены");
+  if (state.uploadId) setStatus("Настройки изменены");
 }
 
 async function loadModels() {
@@ -84,20 +88,48 @@ async function loadModels() {
   } finally { setBusy(false); }
 }
 
+function errorMessage(payload, field = "detail") {
+  const message = typeof payload?.[field] === "string" ? payload[field] : "Не удалось выполнить запрос. Повторите попытку.";
+  const details = [];
+  if (typeof payload?.code === "string") details.push("код: " + payload.code);
+  if (typeof payload?.diagnostic_id === "string") details.push("диагностика: " + payload.diagnostic_id);
+  return message + (details.length ? " (" + details.join(", ") + ")" : "");
+}
+
 async function readError(response) {
   try {
     const payload = await response.json();
-    return typeof payload.detail === "string" ? payload.detail : "Проверьте параметры запроса";
-  } catch { return response.statusText; }
+    let message = errorMessage(payload);
+    const retryAfter = response.headers.get("Retry-After");
+    if (response.status === 429 && retryAfter && /^\d+$/.test(retryAfter)) {
+      message += " Повторите попытку через " + retryAfter + " с.";
+    }
+    return message;
+  } catch { return "Не удалось выполнить запрос. Повторите попытку."; }
+}
+
+function validateSettings(report = false) {
+  // Пробельные символы совпадают с серверной проверкой Python str.strip().
+  if (/^[\u0009-\u000D\u001C-\u0020\u0085\u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000]*$/u.test(promptInput.value)) {
+    if (report) setStatus("Исправьте параметры модели: промпт должен содержать хотя бы один непробельный символ.");
+    return false;
+  }
+  if (utf8.encode(promptInput.value).byteLength > MAX_PROMPT_BYTES) {
+    if (report) setStatus("Исправьте параметры модели: размер промпта не должен превышать 8 КиБ в UTF-8.");
+    return false;
+  }
+  const valid = report ? settingsForm.reportValidity() : settingsForm.checkValidity();
+  if (!valid && report) setStatus("Исправьте параметры модели и повторите действие.");
+  return valid;
 }
 
 async function refreshCachedResult() {
-  if (!state.imagePath || !settingsForm.checkValidity()) return;
+  if (!state.uploadId || state.busy || !validateSettings()) return;
   const revision = state.revision;
   try {
     const response = await fetch("/api/cached-result", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({image_path: state.imagePath, ...selectedSettings()}),
+      body: JSON.stringify({upload_id: state.uploadId, ...selectedSettings()}),
     });
     if (!response.ok) throw new Error(await readError(response));
     const payload = await response.json();
@@ -118,15 +150,15 @@ function canLoadImage() {
       : "Дождитесь загрузки списка моделей и повторите вставку изображения.");
     return false;
   }
-  if (!settingsForm.reportValidity()) {
-    setStatus("Исправьте параметры модели и повторите загрузку изображения.");
-    return false;
-  }
-  return true;
+  return validateSettings(true);
 }
 
 async function handleFile(file, fromClipboard = false) {
   if (!file || !canLoadImage()) return;
+  if (file.size > MAX_UPLOAD_BYTES) {
+    setStatus("Изображение не загружено: размер файла не должен превышать 25 МиБ.");
+    return;
+  }
   if (fromClipboard) appendLog("Получено изображение из буфера обмена.");
   state.revision++;
   setBusy(true);
@@ -139,7 +171,7 @@ async function handleFile(file, fromClipboard = false) {
     const response = await fetch("/api/upload", {method: "POST", body: form});
     if (!response.ok) throw new Error(await readError(response));
     const payload = await response.json();
-    state.imagePath = payload.image_path;
+    state.uploadId = payload.upload_id;
     imagePreview.src = payload.image_url;
     imagePreview.hidden = false;
     $("emptyState").hidden = true;
@@ -153,7 +185,7 @@ async function handleFile(file, fromClipboard = false) {
 }
 
 async function recognize() {
-  if (!state.imagePath || state.busy || !settingsForm.reportValidity()) return;
+  if (!state.uploadId || state.busy || !validateSettings(true)) return;
   state.revision++;
   setBusy(true);
   setStatus("Распознавание...");
@@ -161,7 +193,7 @@ async function recognize() {
   try {
     const response = await fetch("/api/recognize", {
       method: "POST", headers: {"Content-Type": "application/json"},
-      body: JSON.stringify({image_path: state.imagePath, force: forceInput.checked, ...selectedSettings()}),
+      body: JSON.stringify({upload_id: state.uploadId, force: forceInput.checked, ...selectedSettings()}),
     });
     if (!response.ok) throw new Error(await readError(response));
     const payload = await response.json();
@@ -182,17 +214,24 @@ function closeStream() {
 
 function listenJob(jobId) {
   closeStream();
-  state.stream = new EventSource("/api/stream/" + jobId);
-  state.stream.onmessage = (event) => {
-    if (!event.data) return;
+  const stream = new EventSource("/api/stream/" + jobId);
+  state.stream = stream;
+  const isCurrent = () => state.stream === stream && state.jobId === jobId;
+  stream.onopen = () => {
+    if (isCurrent()) setStatus("Распознавание...");
+  };
+  stream.onmessage = (event) => {
+    if (!isCurrent() || !event.data) return;
     const payload = JSON.parse(event.data);
     if (payload.type === "log") appendLog(payload.message);
     if (payload.type === "done") finishJob(payload);
   };
-  state.stream.onerror = () => {
-    setStatus("Ошибка: поток логов оборвался");
+  stream.onerror = () => {
+    if (!isCurrent()) return;
+    setStatus(stream.readyState === EventSource.CLOSED
+      ? "Соединение закрыто; состояние задачи неизвестно. Обновите страницу для восстановления интерфейса."
+      : "Связь прервана; ожидаем восстановления и завершения распознавания.");
     appendLog("Поток логов оборвался; сервер мог продолжить распознавание.");
-    finishBusyState();
   };
 }
 
@@ -215,8 +254,9 @@ function finishJob(payload) {
     }
     appendLog("Завершено: " + result.model_id + ", " + elapsed + " с.");
   } else {
-    setStatus("Ошибка: " + (payload.error || "неизвестная ошибка"));
-    appendLog("Ошибка OCR: " + payload.error);
+    const message = errorMessage(payload, "error");
+    setStatus("Ошибка: " + message);
+    appendLog("Ошибка OCR: " + message);
   }
   finishBusyState();
 }
@@ -263,6 +303,7 @@ document.addEventListener("paste", (event) => {
   event.preventDefault();
   handleFile(file, true);
 });
+settingsForm.addEventListener("submit", (event) => event.preventDefault());
 modelSelect.addEventListener("change", () => { applyDefaults(); refreshCachedResult(); });
 $("resetSettingsBtn").addEventListener("click", () => { applyDefaults(); refreshCachedResult(); });
 for (const input of [promptInput, maxTokensInput, maxPixelsInput, quantizationInput]) {
