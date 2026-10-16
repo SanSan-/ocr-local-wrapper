@@ -28,9 +28,20 @@ class OcrWebJob:
     thread: threading.Thread | None = None
     events: deque[bytes] = field(default_factory=deque)
     log_size: int = 0
+    log_count: int = 0
     dropped: int = 0
     terminal_event: bytes | None = None
     completed_at: float | None = None
+    readers: int = 0
+    subscriptions: set[JobSubscription] = field(default_factory=set, repr=False)
+
+
+@dataclass(eq=False)
+class JobSubscription:
+    job: OcrWebJob
+    drains_logs: bool
+    closed: bool = False
+    in_flight: bytes | None = None
 
 
 class JobRegistry:
@@ -52,9 +63,10 @@ class JobRegistry:
             now = self.clock()
             for job_id, job in list(self.jobs.items()):
                 if job.completed_at is not None and now - job.completed_at >= self.limits.job_ttl_seconds:
-                    job.events.clear()
+                    for subscription in tuple(job.subscriptions):
+                        self.unsubscribe(subscription)
+                    self._clear_journal(job)
                     job.terminal_event = None
-                    job.log_size = 0
                     del self.jobs[job_id]
 
     def check_admission(self) -> None:
@@ -94,8 +106,8 @@ class JobRegistry:
                     self.active_id = None
                 job.terminal_event = encoded
                 job.completed_at = self.clock()
-                job.events.clear()
-                job.log_size = job.dropped = 0
+                if not job.readers:
+                    self._clear_journal(job)
                 job.options = job.reservation = job.thread = None
             elif event.get("type") == "log" and job.completed_at is None:
                 text = str(event.get("message", ""))
@@ -103,17 +115,36 @@ class JobRegistry:
                 if len(raw) > self.limits.log_line_bytes:
                     text = raw[:max(0, self.limits.log_line_bytes - 3)].decode("utf-8", errors="ignore") + "…"
                 encoded = encode_event({"type": "log", "message": text})
-                while job.events and (len(job.events) >= self.limits.log_count or
-                                      job.log_size + len(encoded) > self.limits.log_bytes):
-                    job.log_size -= len(job.events.popleft())
-                    job.dropped += 1
-                if len(encoded) <= self.limits.log_bytes and self.limits.log_count:
+                if self._make_room(job, len(encoded)):
                     job.events.append(encoded)
                     job.log_size += len(encoded)
+                    job.log_count += 1
                 else:
-                    job.dropped += 1
+                    self._record_drop(job)
 
-    def subscribe(self, job_id: str) -> OcrWebJob:
+    @staticmethod
+    def _clear_journal(job: OcrWebJob) -> None:
+        job.events.clear()
+        job.log_size = job.log_count = job.dropped = 0
+
+    @staticmethod
+    def _record_drop(job: OcrWebJob) -> None:
+        job.dropped = min(job.dropped + 1, 2**63 - 1)
+
+    def _fits(self, job: OcrWebJob, size: int) -> bool:
+        return job.log_count < self.limits.log_count and job.log_size + size <= self.limits.log_bytes
+
+    def _evict_oldest(self, job: OcrWebJob) -> None:
+        job.log_size -= len(job.events.popleft())
+        job.log_count -= 1
+        self._record_drop(job)
+
+    def _make_room(self, job: OcrWebJob, size: int) -> bool:
+        while job.events and not self._fits(job, size):
+            self._evict_oldest(job)
+        return self._fits(job, size)
+
+    def subscribe(self, job_id: str) -> JobSubscription:
         with self.lock:
             self.cleanup()
             job = self.jobs.get(job_id)
@@ -121,54 +152,109 @@ class JobRegistry:
                 raise WebError("job_not_found", 404, "Состояние задачи недоступно. Обновите страницу.")
             if self.subscribers >= self.limits.subscriber_count:
                 raise WebError("streams_full", 429, "Открыто слишком много потоков. Повторите позже.")
+            subscription = JobSubscription(job, drains_logs=job.completed_at is None)
+            job.subscriptions.add(subscription)
+            job.readers += int(subscription.drains_logs)
             self.subscribers += 1
-            return job
+            return subscription
 
-    async def events(self, job: OcrWebJob):
-        while True:
-            with self.lock:
-                self.cleanup()
-                if job.job_id not in self.jobs:
-                    return
-                terminal = job.terminal_event
-                if terminal is not None:
-                    payload = terminal
-                elif job.dropped:
-                    payload = encode_event({"type": "log", "message": f"Пропущено старых сообщений: {job.dropped}."})
-                    job.dropped = 0
-                elif job.events:
-                    payload = job.events.popleft()
-                    job.log_size -= len(payload)
-                else:
-                    payload = None
-            yield b"data: " + payload + b"\n\n" if payload is not None else b": keep-alive\n\n"
-            if terminal is not None:
+    def acknowledge(self, subscription: JobSubscription) -> None:
+        with self.lock:
+            if subscription.in_flight is not None:
+                job = subscription.job
+                job.log_size -= len(subscription.in_flight)
+                job.log_count -= 1
+                subscription.in_flight = None
+
+    def unsubscribe(self, subscription: JobSubscription) -> None:
+        with self.lock:
+            if subscription.closed:
                 return
-            if payload is None:
-                await asyncio.sleep(0.25)
+            self.acknowledge(subscription)
+            subscription.closed = True
+            job = subscription.job
+            job.subscriptions.discard(subscription)
+            job.readers -= int(subscription.drains_logs)
+            self.subscribers -= 1
+            if job.completed_at is not None and not job.readers:
+                self._clear_journal(job)
+
+    def _next_log(self, job: OcrWebJob) -> bytes | None:
+        if job.dropped:
+            while True:
+                count = f"не менее {job.dropped}" if job.dropped == 2**63 - 1 else str(job.dropped)
+                payload = encode_event({"type": "log", "message": f"Пропущено старых сообщений: {count}."})
+                if self._fits(job, len(payload)):
+                    job.log_size += len(payload)
+                    job.log_count += 1
+                    job.dropped = 0
+                    return payload
+                if not job.events:
+                    return None
+                self._evict_oldest(job)
+        return job.events.popleft() if job.events else None
+
+    async def events(self, subscription: JobSubscription):
+        job = subscription.job
+        try:
+            while True:
+                with self.lock:
+                    self.cleanup()
+                    if subscription.closed or job.job_id not in self.jobs:
+                        return
+                    if subscription.in_flight is not None:
+                        raise RuntimeError("Предыдущая строка журнала ещё не отправлена.")
+                    terminal = False
+                    if subscription.drains_logs and (job.dropped or job.events):
+                        payload = self._next_log(job)
+                        subscription.in_flight = payload
+                    else:
+                        payload = job.terminal_event
+                        terminal = payload is not None
+                yield b"data: " + payload + b"\n\n" if payload is not None else b": keep-alive\n\n"
+                waiting = payload is None
+                payload = None
+                if terminal:
+                    return
+                if waiting:
+                    await asyncio.sleep(0.25)
+        finally:
+            self.unsubscribe(subscription)
 
 
 class JobStreamResponse(StreamingResponse):
     """Медленная отправка ограничена по времени и освобождает место подписчика."""
 
-    def __init__(self, registry: JobRegistry, job: OcrWebJob) -> None:
-        super().__init__(registry.events(job), media_type="text/event-stream",
-                         headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
-        self.registry, self.job = registry, job
+    def __init__(self, registry: JobRegistry, subscription: JobSubscription) -> None:
+        self.registry, self.subscription = registry, subscription
+        self.job = subscription.job
+        try:
+            super().__init__(registry.events(subscription), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"})
+        except BaseException:
+            registry.unsubscribe(subscription)
+            raise
 
     async def __call__(self, scope, receive, send) -> None:
         async def bounded_send(message):
+            if self.subscription.closed and not (
+                    message["type"] == "http.response.body" and not message.get("more_body", False)):
+                raise ClientDisconnect
             timeout = self.registry.limits.send_timeout_seconds
             if self.job.completed_at is not None:
                 timeout = min(timeout, self.job.completed_at + self.registry.limits.job_ttl_seconds - self.registry.clock())
             if timeout <= 0:
                 raise TimeoutError
             await asyncio.wait_for(send(message), timeout)
+            if message["type"] == "http.response.body":
+                self.registry.acknowledge(self.subscription)
 
         try:
             await super().__call__(scope, receive, bounded_send)
         except* (TimeoutError, OSError, ClientDisconnect):
             pass
         finally:
-            with self.registry.lock:
-                self.registry.subscribers -= 1
+            try:
+                await self.body_iterator.aclose()
+            finally:
+                self.registry.unsubscribe(self.subscription)

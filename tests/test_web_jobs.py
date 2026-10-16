@@ -50,14 +50,37 @@ async def pending_receive():
 
 
 async def collect_response(registry, job, *, version="2.4"):
+    return await collect_subscription_response(registry, registry.subscribe(job.job_id), version=version)
+
+
+async def collect_subscription_response(registry, subscription, *, version="2.4"):
     messages = []
 
     async def send(message):
         messages.append(message)
 
-    response = JobStreamResponse(registry, registry.subscribe(job.job_id))
+    response = JobStreamResponse(registry, subscription)
     await response(scope(version), pending_receive, send)
     return b"".join(message.get("body", b"") for message in messages)
+
+
+def response_events(body):
+    return [json.loads(line[6:]) for line in body.splitlines() if line.startswith(b"data: ")]
+
+
+def assert_log_accounting(job, subscriptions):
+    sending = [item.in_flight for item in subscriptions if item.in_flight is not None]
+    assert job.log_count == len(job.events) + len(sending)
+    assert job.log_size == sum(map(len, job.events)) + sum(map(len, sending))
+
+
+async def cancel_stream(task):
+    if not task.done():
+        task.cancel()
+    try:
+        await task
+    except BaseException as error:
+        assert all(isinstance(leaf, asyncio.CancelledError) for leaf in exception_leaves(error))
 
 
 def event_payload(chunk):
@@ -286,17 +309,26 @@ def test_log_count_evicts_oldest_and_reports_dropped_lines_once():
     assert job.log_size == sum(map(len, job.events)) <= DEFAULT_LIMITS.log_bytes
 
     async def read_prefix():
-        events = registry.events(job)
-        summary = event_payload(await anext(events))
-        first = event_payload(await anext(events))
-        await events.aclose()
-        return summary, first
+        subscription = registry.subscribe(job.job_id)
+        events = registry.events(subscription)
+        try:
+            summary = event_payload(await anext(events))
+            assert_log_accounting(job, [subscription])
+            assert job.log_count <= DEFAULT_LIMITS.log_count
+            registry.acknowledge(subscription)
+            first = event_payload(await anext(events))
+            registry.acknowledge(subscription)
+            return summary, first
+        finally:
+            await events.aclose()
+            registry.unsubscribe(subscription)
 
     summary, first = asyncio.run(read_prefix())
-    assert summary == {"type": "log", "message": "Пропущено старых сообщений: 7."}
-    assert first == {"type": "log", "message": "Строка 7"}
+    # Само уведомление занимает место: при полной очереди вытесняется ещё одна строка.
+    assert summary == {"type": "log", "message": "Пропущено старых сообщений: 8."}
+    assert first == {"type": "log", "message": "Строка 8"}
     assert job.dropped == 0
-    assert len(job.events) == 249
+    assert len(job.events) == 248
     assert job.log_size == sum(map(len, job.events))
 
 
@@ -429,34 +461,607 @@ def test_stream_admitted_before_expiry_stops_without_sending_after_expiry(versio
     assert registry.subscribers == 0
 
 
-def test_nested_transport_exception_group_is_handled_and_subscriber_released():
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_nested_transport_exception_group_is_handled_and_subscriber_released(version):
     registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+    registry.emit(job, {"type": "log", "message": "Строка до отказа транспорта."})
+    registry.emit(job, done())
 
     async def grouped_failure():
         async def send(message):
+            if not message.get("body", b"").startswith(b"data: "):
+                return
+            assert subscription.in_flight is not None
             raise ExceptionGroup("Транспорт", [TimeoutError(), ExceptionGroup("Вложенная", [
                 OSError("Соединение закрыто"), ClientDisconnect(),
             ])])
 
-        response = JobStreamResponse(registry, registry.subscribe(job.job_id))
-        await response(scope(), pending_receive, send)
+        response = JobStreamResponse(registry, subscription)
+        await response(scope(version), pending_receive, send)
 
     asyncio.run(grouped_failure())
-    assert registry.subscribers == 0
+    assert registry.subscribers == job.readers == job.log_count == job.log_size == 0
+    assert subscription.closed and subscription.in_flight is None
 
 
-def test_unexpected_exception_in_group_is_not_silenced_and_subscriber_released():
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_unexpected_exception_in_group_is_not_silenced_and_subscriber_released(version):
     registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+    registry.emit(job, {"type": "log", "message": "Строка до непредусмотренной ошибки."})
+    registry.emit(job, done())
 
     async def grouped_failure():
         async def send(message):
+            if not message.get("body", b"").startswith(b"data: "):
+                return
+            assert subscription.in_flight is not None
             raise ExceptionGroup("Смешанная ошибка", [TimeoutError(), RuntimeError("Ошибка реализации")])
 
-        response = JobStreamResponse(registry, registry.subscribe(job.job_id))
-        await response(scope(), pending_receive, send)
+        response = JobStreamResponse(registry, subscription)
+        await response(scope(version), pending_receive, send)
 
     with pytest.raises(ExceptionGroup) as failure:
         asyncio.run(grouped_failure())
     leaves = exception_leaves(failure.value)
     assert len(leaves) == 1 and isinstance(leaves[0], RuntimeError)
+    assert registry.subscribers == job.readers == job.log_count == job.log_size == 0
+    assert subscription.closed and subscription.in_flight is None
+
+
+@pytest.mark.parametrize(("status", "version"), [
+    ("ok", "2.4"), ("error", "2.4"), ("ok", "2.3"), ("error", "2.3"),
+], ids=["ok-asgi24", "error-asgi24", "ok-asgi23", "error-asgi23"])
+def test_pending_logs_precede_done_after_keepalive(status, version):
+    registry, job = registry_with_job()
+    expected_logs = [
+        {"type": "log", "message": "Первая ожидающая строка."},
+        {"type": "log", "message": "Вторая ожидающая строка."},
+    ]
+    terminal = done(status)
+    delivered = []
+
+    async def controlled_response():
+        waiting = asyncio.Event()
+        resume = asyncio.Event()
+
+        async def send(message):
+            body = message.get("body", b"")
+            if body == b": keep-alive\n\n" and not waiting.is_set():
+                waiting.set()
+                await resume.wait()
+            if body.startswith(b"data: "):
+                delivered.append(event_payload(body))
+
+        response = JobStreamResponse(registry, registry.subscribe(job.job_id))
+        task = asyncio.create_task(response(scope(version), pending_receive, send))
+        try:
+            await asyncio.wait_for(waiting.wait(), 1)
+            for event in expected_logs:
+                registry.emit(job, event)
+            registry.emit(job, terminal)
+        finally:
+            resume.set()
+        await asyncio.wait_for(task, 1)
+
+    asyncio.run(controlled_response())
+    assert delivered == [*expected_logs, terminal]
     assert registry.subscribers == 0
+    assert not job.events and job.log_size == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+@pytest.mark.parametrize("status", ["ok", "error"])
+def test_early_subscription_with_empty_queue_receives_only_done(version, status):
+    registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+    registry.emit(job, done(status))
+
+    body = asyncio.run(collect_subscription_response(registry, subscription, version=version))
+
+    assert response_events(body) == [done(status)]
+    assert subscription.closed and subscription.in_flight is None
+    assert job.readers == job.log_count == job.log_size == registry.subscribers == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_two_early_streams_share_logs_and_fast_done_does_not_wait(version):
+    registry, job = registry_with_job()
+    slow = registry.subscribe(job.job_id)
+    fast = registry.subscribe(job.job_id)
+    first = {"type": "log", "message": "Строка медленного потока."}
+    second = {"type": "log", "message": "Строка быстрого потока."}
+    registry.emit(job, first)
+    registry.emit(job, second)
+    registry.emit(job, done())
+    original_terminal, original_completion = job.terminal_event, job.completed_at
+    slow_delivered = []
+
+    async def run_streams():
+        selected = asyncio.Event()
+        release = asyncio.Event()
+
+        async def send_slow(message):
+            body = message.get("body", b"")
+            if not body.startswith(b"data: "):
+                return
+            event = event_payload(body)
+            if event["type"] == "log":
+                selected.set()
+                await release.wait()
+            slow_delivered.append(event)
+
+        task = asyncio.create_task(JobStreamResponse(registry, slow)(scope(version), pending_receive, send_slow))
+        try:
+            await asyncio.wait_for(selected.wait(), 1)
+            assert slow.in_flight is not None
+            assert_log_accounting(job, [slow, fast])
+            assert job.log_count == 2
+            body = await asyncio.wait_for(collect_subscription_response(registry, fast, version=version), 1)
+            assert response_events(body) == [second, done()]
+            assert not task.done() and slow_delivered == []
+            assert job.readers == registry.subscribers == 1
+            assert job.log_count == 1 and not job.events
+            assert_log_accounting(job, [slow, fast])
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 1)
+
+    asyncio.run(run_streams())
+    assert slow_delivered == [first, done()]
+    assert job.terminal_event == original_terminal and job.completed_at == original_completion
+    assert job.readers == job.log_count == job.log_size == registry.subscribers == 0
+    assert slow.closed and fast.closed
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_late_stream_neither_steals_nor_retains_early_tail(version):
+    registry, job = registry_with_job()
+    early = registry.subscribe(job.job_id)
+    for text in ("Первая строка.", "Вторая строка."):
+        registry.emit(job, {"type": "log", "message": text})
+    registry.emit(job, done())
+    original_queue = list(job.events)
+
+    async def late_streams():
+        body = await collect_response(registry, job, version=version)
+        assert response_events(body) == [done()]
+        assert list(job.events) == original_queue and job.readers == 1
+
+        late = registry.subscribe(job.job_id)
+        assert not late.drains_logs
+        selected, release = asyncio.Event(), asyncio.Event()
+        delivered = []
+
+        async def send(message):
+            body = message.get("body", b"")
+            if body.startswith(b"data: "):
+                selected.set()
+                await release.wait()
+                delivered.append(event_payload(body))
+
+        task = asyncio.create_task(JobStreamResponse(registry, late)(scope(version), pending_receive, send))
+        try:
+            await asyncio.wait_for(selected.wait(), 1)
+            assert list(job.events) == original_queue
+            registry.unsubscribe(early)
+            registry.unsubscribe(early)
+            assert early.closed and job.readers == 0
+            assert not job.events and job.log_count == job.log_size == job.dropped == 0
+            assert registry.subscribers == 1 and not late.closed
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 1)
+        assert delivered == [done()]
+
+    asyncio.run(late_streams())
+    assert registry.subscribers == 0
+    assert job.terminal_event is not None
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_closing_one_early_reader_preserves_tail_for_other(version):
+    registry, job = registry_with_job()
+    first = registry.subscribe(job.job_id)
+    second = registry.subscribe(job.job_id)
+    event = {"type": "log", "message": "Оставшаяся строка."}
+    registry.emit(job, event)
+    registry.emit(job, done("error"))
+
+    registry.unsubscribe(first)
+    registry.unsubscribe(first)
+    assert job.readers == registry.subscribers == 1
+    assert job.log_count == len(job.events) == 1
+    body = asyncio.run(collect_subscription_response(registry, second, version=version))
+
+    assert response_events(body) == [event, done("error")]
+    assert job.readers == job.log_count == job.log_size == registry.subscribers == 0
+
+
+def test_other_job_subscription_does_not_retain_unsubscribed_completed_log():
+    registry, old_job = registry_with_job()
+    old_subscription = registry.subscribe(old_job.job_id)
+    registry.emit(old_job, done())
+    job = registry.add(None, None)
+    registry.emit(job, {"type": "log", "message": "Журнал другой задачи."})
+
+    registry.emit(job, done())
+
+    assert registry.subscribers == old_job.readers == 1
+    assert job.readers == job.log_count == job.log_size == job.dropped == 0
+    assert not job.events and job.terminal_event is not None
+    registry.unsubscribe(old_subscription)
+    assert registry.subscribers == 0
+
+
+def test_last_unsubscribe_during_active_job_preserves_bounded_log():
+    registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+    event = {"type": "log", "message": "Строка активной задачи."}
+    registry.emit(job, event)
+
+    registry.unsubscribe(subscription)
+    registry.unsubscribe(subscription)
+
+    assert job.readers == registry.subscribers == 0
+    assert len(job.events) == job.log_count == 1
+    assert job.completed_at is None and registry.active_id == job.job_id
+    replacement = registry.subscribe(job.job_id)
+    registry.emit(job, done())
+    assert response_events(asyncio.run(collect_subscription_response(registry, replacement))) == [event, done()]
+
+
+@pytest.mark.parametrize("subscribe_first", [True, False])
+def test_subscription_registration_has_unambiguous_completion_order(subscribe_first):
+    registry, job = registry_with_job()
+    event = {"type": "log", "message": "Строка до завершения."}
+    registry.emit(job, event)
+    if subscribe_first:
+        subscription = registry.subscribe(job.job_id)
+        registry.emit(job, done())
+    else:
+        registry.emit(job, done())
+        subscription = registry.subscribe(job.job_id)
+
+    assert subscription.drains_logs is subscribe_first
+    assert job.readers == int(subscribe_first)
+    expected = [event, done()] if subscribe_first else [done()]
+    assert response_events(asyncio.run(collect_subscription_response(registry, subscription))) == expected
+
+
+def test_concurrent_registration_and_completion_remain_consistent():
+    registry, job = registry_with_job()
+    registry.emit(job, {"type": "log", "message": "Строка на границе завершения."})
+    barrier = threading.Barrier(2, timeout=2)
+    subscriptions, failures = [], []
+
+    def register():
+        try:
+            barrier.wait()
+            subscriptions.append(registry.subscribe(job.job_id))
+        except BaseException as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=register)
+    thread.start()
+    try:
+        barrier.wait()
+        registry.emit(job, done())
+    finally:
+        thread.join(timeout=2)
+    assert not thread.is_alive() and not failures
+    assert len(subscriptions) == registry.subscribers == 1
+    subscription = subscriptions[0]
+    assert job.readers == int(subscription.drains_logs)
+    assert bool(job.events) is subscription.drains_logs
+    registry.unsubscribe(subscription)
+    assert job.readers == registry.subscribers == job.log_count == job.log_size == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+@pytest.mark.parametrize("capacity", [1, 2])
+def test_blocked_send_counts_toward_quota_and_overflow_precedes_done(version, capacity):
+    limits = replace(DEFAULT_LIMITS, log_count=capacity, log_bytes=256)
+    registry, job = registry_with_job(limits=limits)
+    subscription = registry.subscribe(job.job_id)
+    first = {"type": "log", "message": "Отправляемая строка."}
+    second = {"type": "log", "message": "Вытесненная строка."}
+    third = {"type": "log", "message": "Последняя строка."}
+    registry.emit(job, first)
+    delivered = []
+
+    async def controlled_send():
+        selected, release = asyncio.Event(), asyncio.Event()
+
+        async def send(message):
+            body = message.get("body", b"")
+            if not body.startswith(b"data: "):
+                return
+            event = event_payload(body)
+            if event == first:
+                selected.set()
+                await release.wait()
+            assert_log_accounting(job, [subscription])
+            assert job.log_count <= capacity and job.log_size <= limits.log_bytes
+            delivered.append(event)
+
+        task = asyncio.create_task(JobStreamResponse(registry, subscription)(scope(version), pending_receive, send))
+        try:
+            await asyncio.wait_for(selected.wait(), 1)
+            in_flight = subscription.in_flight
+            assert in_flight is not None and job.log_count == 1
+            assert job.log_size == len(in_flight)
+            registry.emit(job, second)
+            registry.emit(job, third)
+            assert subscription.in_flight == in_flight
+            assert_log_accounting(job, [subscription])
+            assert job.log_count == capacity and job.dropped == 3 - capacity
+            registry.emit(job, done())
+            assert registry.active_id is None
+            assert subscription.in_flight == in_flight
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 1)
+
+    asyncio.run(controlled_send())
+    notice = {"type": "log", "message": f"Пропущено старых сообщений: {3 - capacity}."}
+    expected = [first, notice, third, done()] if capacity == 2 else [first, notice, done()]
+    assert delivered == expected
+    assert job.log_count == job.log_size == job.dropped == job.readers == registry.subscribers == 0
+    assert subscription.in_flight is None and subscription.closed
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_byte_quota_includes_blocked_log_and_notice(version):
+    limits = replace(DEFAULT_LIMITS, log_bytes=200)
+    registry, job = registry_with_job(limits=limits)
+    subscription = registry.subscribe(job.job_id)
+    first = {"type": "log", "message": "я" * 80}
+    registry.emit(job, first)
+    delivered = []
+
+    async def controlled_response():
+        selected, release = asyncio.Event(), asyncio.Event()
+
+        async def send(message):
+            body = message.get("body", b"")
+            if not body.startswith(b"data: "):
+                return
+            event = event_payload(body)
+            if event == first:
+                selected.set()
+                await release.wait()
+            assert_log_accounting(job, [subscription])
+            assert job.log_size <= limits.log_bytes
+            if event["type"] == "log":
+                assert subscription.in_flight is not None and job.log_count == 1
+            else:
+                assert subscription.in_flight is None and job.log_count == job.log_size == 0
+            delivered.append(event)
+
+        task = asyncio.create_task(JobStreamResponse(registry, subscription)(scope(version), pending_receive, send))
+        try:
+            await asyncio.wait_for(selected.wait(), 1)
+            registry.emit(job, {"type": "log", "message": "Б"})
+            assert not job.events and job.dropped == 1
+            assert_log_accounting(job, [subscription])
+            registry.emit(job, done())
+        finally:
+            release.set()
+            await asyncio.wait_for(task, 1)
+
+    asyncio.run(controlled_response())
+    assert delivered == [first, {"type": "log", "message": "Пропущено старых сообщений: 1."}, done()]
+    assert registry.subscribers == job.readers == job.log_count == job.log_size == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+@pytest.mark.parametrize("failure", ["cancel", "timeout", "disconnect", "transport"])
+def test_interrupted_log_send_releases_only_its_reader_and_in_flight(version, failure):
+    limits = replace(DEFAULT_LIMITS, send_timeout_seconds=0.01 if failure == "timeout" else 10)
+    registry, job = registry_with_job(limits=limits)
+    interrupted = registry.subscribe(job.job_id)
+    remaining = registry.subscribe(job.job_id)
+    first = {"type": "log", "message": "Прерванная отправка."}
+    second = {"type": "log", "message": "Оставшийся хвост."}
+    registry.emit(job, first)
+    registry.emit(job, second)
+    registry.emit(job, done("error"))
+    original_terminal, original_completion = job.terminal_event, job.completed_at
+
+    async def interrupted_response():
+        selected = asyncio.Event()
+
+        async def receive():
+            if failure == "disconnect" and version == "2.3":
+                await selected.wait()
+                return {"type": "http.disconnect"}
+            return await pending_receive()
+
+        async def send(message):
+            if not message.get("body", b"").startswith(b"data: "):
+                return
+            assert event_payload(message["body"]) == first
+            assert interrupted.in_flight is not None
+            assert_log_accounting(job, [interrupted, remaining])
+            selected.set()
+            if failure == "transport":
+                raise OSError("Соединение потеряно во время отправки строки.")
+            if failure == "disconnect" and version == "2.4":
+                raise ClientDisconnect()
+            await asyncio.Future()
+
+        task = asyncio.create_task(JobStreamResponse(registry, interrupted)(scope(version), receive, send))
+        await asyncio.wait_for(selected.wait(), 1)
+        if failure == "cancel":
+            await asyncio.wait_for(cancel_stream(task), 1)
+        else:
+            await asyncio.wait_for(task, 1)
+        registry.unsubscribe(interrupted)
+        registry.acknowledge(interrupted)
+        assert interrupted.closed and interrupted.in_flight is None
+        assert registry.subscribers == job.readers == 1
+        assert len(job.events) == job.log_count == 1
+        assert_log_accounting(job, [interrupted, remaining])
+        body = await collect_subscription_response(registry, remaining, version=version)
+        assert response_events(body) == [second, done("error")]
+
+    asyncio.run(interrupted_response())
+    assert job.terminal_event == original_terminal and job.completed_at == original_completion
+    assert registry.subscribers == job.readers == job.log_count == job.log_size == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_expiry_during_log_send_releases_state_without_double_unsubscribe(version):
+    clock = Clock()
+    registry, job = registry_with_job(clock=clock)
+    subscription = registry.subscribe(job.job_id)
+    registry.emit(job, {"type": "log", "message": "Строка у границы срока."})
+    registry.emit(job, {"type": "log", "message": "Неотправленный хвост."})
+    registry.emit(job, done())
+    completed_at = job.completed_at
+    clock.now = completed_at + DEFAULT_LIMITS.job_ttl_seconds - 0.01
+    selected = []
+
+    async def expires_while_sending():
+        async def send(message):
+            if not message.get("body", b"").startswith(b"data: "):
+                return
+            selected.append(event_payload(message["body"]))
+            assert subscription.in_flight is not None
+            clock.now += 0.02
+            registry.cleanup()
+            assert job.job_id not in registry.jobs and job.terminal_event is None
+            assert subscription.closed and subscription.in_flight is None
+            assert job.log_count == job.log_size == job.readers == registry.subscribers == 0
+            await asyncio.Future()
+
+        await asyncio.wait_for(JobStreamResponse(registry, subscription)(scope(version), pending_receive, send), 1)
+
+    asyncio.run(expires_while_sending())
+    assert len(selected) == 1 and selected[0]["type"] == "log"
+    registry.unsubscribe(subscription)
+    registry.acknowledge(subscription)
+    assert registry.subscribers == job.readers == 0
+    assert job.completed_at == completed_at
+    with pytest.raises(WebError) as failure:
+        registry.subscribe(job.job_id)
+    assert (failure.value.status_code, failure.value.code) == (404, "job_not_found")
+
+
+def test_response_constructor_failure_releases_subscription(monkeypatch):
+    registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+
+    def fail(*args, **kwargs):
+        raise RuntimeError("Не удалось создать ответ.")
+
+    monkeypatch.setattr("starlette.responses.StreamingResponse.__init__", fail)
+    with pytest.raises(RuntimeError, match="Не удалось создать ответ"):
+        JobStreamResponse(registry, subscription)
+
+    assert subscription.closed and subscription.in_flight is None
+    assert registry.subscribers == job.readers == 0
+    registry.unsubscribe(subscription)
+    assert registry.subscribers == job.readers == 0
+    assert registry.active_id == job.job_id
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_iterator_close_failure_does_not_leak_subscription(version):
+    registry, job = registry_with_job()
+    subscription = registry.subscribe(job.job_id)
+    registry.emit(job, {"type": "log", "message": "Строка перед закрытием."})
+    registry.emit(job, done())
+    response = JobStreamResponse(registry, subscription)
+    original_iterator = response.body_iterator
+
+    class FailingClose:
+        def __aiter__(self):
+            return self
+
+        async def __anext__(self):
+            return await anext(original_iterator)
+
+        async def aclose(self):
+            await original_iterator.aclose()
+            raise RuntimeError("Ошибка закрытия итератора.")
+
+    response.body_iterator = FailingClose()
+
+    async def close_fails():
+        async def send(message):
+            pass
+
+        await response(scope(version), pending_receive, send)
+
+    with pytest.raises(RuntimeError, match="Ошибка закрытия итератора"):
+        asyncio.run(close_fails())
+    assert subscription.closed and subscription.in_flight is None
+    assert job.readers == job.log_count == job.log_size == registry.subscribers == 0
+    registry.unsubscribe(subscription)
+    assert registry.subscribers == 0
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_drop_notice_waits_for_budget_occupied_by_other_stream(version):
+    limits = replace(DEFAULT_LIMITS, log_count=1, log_bytes=256)
+    registry, job = registry_with_job(limits=limits)
+    first_reader = registry.subscribe(job.job_id)
+    waiting_reader = registry.subscribe(job.job_id)
+    event = {"type": "log", "message": "Единственная отправляемая строка."}
+    registry.emit(job, event)
+    first_delivered, waiting_delivered = [], []
+
+    async def controlled_streams():
+        first_selected, waiting = asyncio.Event(), asyncio.Event()
+        release_first, release_waiting = asyncio.Event(), asyncio.Event()
+
+        async def first_send(message):
+            body = message.get("body", b"")
+            if not body.startswith(b"data: "):
+                return
+            payload = event_payload(body)
+            if payload == event:
+                first_selected.set()
+                await release_first.wait()
+            assert_log_accounting(job, [first_reader, waiting_reader])
+            assert job.log_count <= 1 and job.log_size <= limits.log_bytes
+            first_delivered.append(payload)
+
+        async def waiting_send(message):
+            body = message.get("body", b"")
+            if body == b": keep-alive\n\n":
+                waiting.set()
+                await release_waiting.wait()
+            elif body.startswith(b"data: "):
+                waiting_delivered.append(event_payload(body))
+
+        first_task = asyncio.create_task(JobStreamResponse(registry, first_reader)(
+            scope(version), pending_receive, first_send))
+        waiting_task = None
+        try:
+            await asyncio.wait_for(first_selected.wait(), 1)
+            registry.emit(job, {"type": "log", "message": "Отброшенная строка."})
+            registry.emit(job, done())
+            waiting_task = asyncio.create_task(JobStreamResponse(registry, waiting_reader)(
+                scope(version), pending_receive, waiting_send))
+            await asyncio.wait_for(waiting.wait(), 1)
+            assert waiting_delivered == [] and not waiting_task.done()
+            assert job.dropped == 1 and job.log_count == 1 and not job.events
+            assert waiting_reader.in_flight is None
+            assert_log_accounting(job, [first_reader, waiting_reader])
+            release_first.set()
+            await asyncio.wait_for(first_task, 1)
+        finally:
+            release_first.set()
+            release_waiting.set()
+            await asyncio.wait_for(first_task, 1)
+            if waiting_task is not None:
+                await asyncio.wait_for(waiting_task, 1)
+
+    asyncio.run(controlled_streams())
+    assert first_delivered == [event, {"type": "log", "message": "Пропущено старых сообщений: 1."}, done()]
+    assert waiting_delivered == [done()]
+    assert registry.subscribers == job.readers == job.log_count == job.log_size == job.dropped == 0

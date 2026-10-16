@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -56,6 +58,29 @@ def events(client, job_id):
 def fake_result(options, text="Готовый текст"):
     return OcrResult(options.input_path, options.output_path, text, "cpu", False,
                      model_id=options.model_id, settings=settings_identity(options))
+
+
+async def serve_stream(job_id, send, version):
+    """Исполняет реальный SSE-ответ с управляемой отправкой без буферизации TestClient."""
+    async def receive():
+        await asyncio.Future()
+
+    scope = {"type": "http", "method": "GET", "path": f"/api/stream/{job_id}", "headers": [],
+             "asgi": {"version": "3.0", "spec_version": version}}
+    await web_app.stream(job_id)(scope, receive, send)
+
+
+def stream_frames(messages):
+    return [message["body"] for message in messages
+            if message["type"] == "http.response.body" and message.get("body", b"").startswith(b"data: ")]
+
+
+def stream_payloads(messages):
+    return [json.loads(frame[6:-2]) for frame in stream_frames(messages)]
+
+
+async def wait_worker_event(event):
+    assert await asyncio.to_thread(event.wait, 3), "Проверочный поток OCR не достиг ожидаемой стадии"
 
 
 def test_startup_and_catalog_do_not_load_model(client, monkeypatch):
@@ -187,6 +212,184 @@ def test_completed_stream_replays_terminal_event_without_new_ocr(client, monkeyp
     assert events(client, job_id) == [first]
     assert events(client, job_id) == [first]
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+@pytest.mark.parametrize("outcome", ["ok", "error"])
+def test_stream_sends_pending_logs_before_done_and_replays_identical_bytes(client, monkeypatch, outcome, version):
+    uploaded = upload(client)
+    release_ocr, published = threading.Event(), threading.Event()
+    calls = []
+    original_emit = web_app._emit_job_event
+
+    def capture_publication(job, event):
+        original_emit(job, event)
+        if event["type"] == "done":
+            published.set()
+
+    def fake_run(options, *, loader, storage_policy):
+        calls.append(options)
+        assert release_ocr.wait(3), "Не разрешено завершить проверочный OCR"
+        web_app.logger.info("Проверочная стадия", extra={"ocr_stage": "limit"})
+        web_app.logger.info("Проверочная стадия", extra={"ocr_stage": "started"})
+        if outcome == "error":
+            raise RuntimeError("Проверочная ошибка распознавания")
+        return fake_result(options)
+
+    monkeypatch.setattr(web_app, "_emit_job_event", capture_publication)
+    monkeypatch.setattr(web_app, "run_ocr", fake_run)
+    response = client.post("/api/recognize", json={"upload_id": uploaded["upload_id"]})
+    assert response.status_code == 200
+    job_id = response.json()["job_id"]
+
+    async def exercise():
+        paused, resume = asyncio.Event(), asyncio.Event()
+        messages = []
+        tail_start = 0
+
+        async def send(message):
+            nonlocal tail_start
+            if message.get("body") == b": keep-alive\n\n" and not paused.is_set():
+                tail_start = len(messages)
+                paused.set()
+                await resume.wait()
+            messages.append(message)
+
+        task = asyncio.create_task(serve_stream(job_id, send, version))
+        try:
+            await asyncio.wait_for(paused.wait(), 3)
+            release_ocr.set()
+            await wait_worker_event(published)
+            assert web_app._registry.active_id is None
+            resume.set()
+            await asyncio.wait_for(task, 3)
+            return messages[tail_start:]
+        finally:
+            release_ocr.set()
+            resume.set()
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    messages = asyncio.run(exercise())
+    payloads = stream_payloads(messages)
+    expected_stages = ["limit", "started"] + (["finished"] if outcome == "ok" else [])
+    assert payloads[:-1] == [
+        {"type": "log", "message": web_app.QueueLogHandler.messages[stage]} for stage in expected_stages
+    ]
+    assert payloads[-1]["type"] == "done" and payloads[-1]["status"] == outcome
+    terminal_frame = stream_frames(messages)[-1]
+    for _ in range(2):
+        replay = client.get(f"/api/stream/{job_id}")
+        assert replay.status_code == 200 and replay.content == terminal_frame
+    assert len(calls) == 1 and web_app._registry.subscribers == 0
+    assert not web_app._registry.jobs[job_id].events and not web_app._storage._reservations
+
+
+@pytest.mark.parametrize("version", ["2.3", "2.4"])
+def test_new_ocr_and_late_replay_do_not_mix_with_old_stream_draining(client, monkeypatch, version):
+    uploaded = upload(client)
+    prompts = ("Первый запуск", "Второй запуск")
+    releases = {prompt: threading.Event() for prompt in prompts}
+    publications = {prompt: threading.Event() for prompt in prompts}
+    calls = []
+    original_emit = web_app._emit_job_event
+
+    def capture_publication(job, event):
+        prompt = job.options.prompt if event["type"] == "done" else None
+        original_emit(job, event)
+        if prompt is not None:
+            publications[prompt].set()
+
+    def fake_run(options, *, loader, storage_policy):
+        calls.append(options.prompt)
+        assert releases[options.prompt].wait(3), "Не разрешено завершить проверочный OCR"
+        for _ in range(prompts.index(options.prompt) + 1):
+            web_app.logger.info("Проверочная стадия", extra={"ocr_stage": "limit"})
+        return fake_result(options, text=options.prompt)
+
+    monkeypatch.setattr(web_app, "_emit_job_event", capture_publication)
+    monkeypatch.setattr(web_app, "run_ocr", fake_run)
+    first = client.post("/api/recognize", json={"upload_id": uploaded["upload_id"], "prompt": prompts[0]})
+    assert first.status_code == 200
+    first_id = first.json()["job_id"]
+
+    async def exercise():
+        ready = [asyncio.Event(), asyncio.Event()]
+        resume = [asyncio.Event(), asyncio.Event()]
+        draining, finish_old = asyncio.Event(), asyncio.Event()
+        messages = [[], []]
+        running = []
+
+        def sender(index):
+            async def send(message):
+                body = message.get("body", b"")
+                if body == b": keep-alive\n\n" and not ready[index].is_set():
+                    ready[index].set()
+                    await resume[index].wait()
+                if index == 0 and body.startswith(b"data: ") and not draining.is_set():
+                    payload = json.loads(body[6:-2])
+                    if payload.get("message") == web_app.QueueLogHandler.messages["limit"]:
+                        draining.set()
+                        await finish_old.wait()
+                messages[index].append(message)
+            return send
+
+        running.append(asyncio.create_task(serve_stream(first_id, sender(0), version)))
+        try:
+            await asyncio.wait_for(ready[0].wait(), 3)
+            releases[prompts[0]].set()
+            await wait_worker_event(publications[prompts[0]])
+            resume[0].set()
+            await asyncio.wait_for(draining.wait(), 3)
+            assert web_app._registry.active_id is None
+
+            second = client.post("/api/recognize", json={"upload_id": uploaded["upload_id"], "prompt": prompts[1]})
+            assert second.status_code == 200
+            second_id = second.json()["job_id"]
+            assert second_id != first_id and web_app._registry.active_id == second_id
+            running.append(asyncio.create_task(serve_stream(second_id, sender(1), version)))
+            await asyncio.wait_for(ready[1].wait(), 3)
+
+            replay = client.get(f"/api/stream/{first_id}")
+            assert replay.status_code == 200
+            assert json.loads(replay.content[6:-2])["result"]["text"] == prompts[0]
+            assert not running[0].done()
+
+            releases[prompts[1]].set()
+            await wait_worker_event(publications[prompts[1]])
+            resume[1].set()
+            await asyncio.wait_for(running[1], 3)
+            assert not running[0].done()
+            finish_old.set()
+            await asyncio.wait_for(running[0], 3)
+            return messages, second_id, replay.content
+        finally:
+            for gate in releases.values():
+                gate.set()
+            for gate in resume:
+                gate.set()
+            finish_old.set()
+            for task in running:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*running, return_exceptions=True)
+
+    messages, second_id, early_replay = asyncio.run(exercise())
+    assert calls == list(prompts)
+    for index, job_id in enumerate((first_id, second_id)):
+        payloads = stream_payloads(messages[index])
+        expected_stages = ["started"] + ["limit"] * (index + 1) + ["finished"]
+        assert payloads[:-1] == [
+            {"type": "log", "message": web_app.QueueLogHandler.messages[stage]} for stage in expected_stages
+        ]
+        assert payloads[-1]["type"] == "done" and payloads[-1]["status"] == "ok"
+        assert payloads[-1]["result"]["text"] == prompts[index]
+        replay = client.get(f"/api/stream/{job_id}")
+        assert replay.status_code == 200 and replay.content == stream_frames(messages[index])[-1]
+    assert early_replay == stream_frames(messages[0])[-1]
+    assert calls == list(prompts) and web_app._registry.subscribers == 0
+    assert not web_app._storage._reservations
 
 
 @pytest.mark.parametrize("outcome", ["ok", "error"])
