@@ -137,11 +137,51 @@ def test_periodic_cleanup_runs_within_thirty_seconds_after_expiry(monkeypatch):
     monkeypatch.setattr(web_app, "_registry", registry)
     monkeypatch.setattr(web_app, "LIMITS", DEFAULT_LIMITS)
     monkeypatch.setattr(web_app.asyncio, "sleep", advance_then_stop)
+    cleanup = web_app._clean_jobs()
     with pytest.raises(asyncio.CancelledError):
-        asyncio.run(web_app._clean_jobs())
+        asyncio.run(cleanup)
     assert intervals == [30.0]
     assert expiry <= clock.now <= expiry + 30
     assert job.job_id not in registry.jobs
+
+
+def test_cleanup_expires_multiple_jobs_without_touching_recent_or_active_job():
+    clock = Clock(0.0)
+    registry = JobRegistry(DEFAULT_LIMITS, clock=clock)
+    expired, readers = [], []
+    for _ in range(2):
+        job = registry.add(None, None)
+        reader = registry.subscribe(job.job_id)
+        registry.emit(job, {"type": "log", "message": "Ожидающая строка"})
+        registry.emit(job, done())
+        expired.append(job)
+        readers.append(reader)
+    clock.now = 1.0
+    recent = registry.add(None, None)
+    registry.emit(recent, done())
+    recent_terminal = recent.terminal_event
+    active = registry.add(None, None)
+    active_reader = registry.subscribe(active.job_id)
+    registry.emit(active, {"type": "log", "message": "Текущая строка"})
+    active_events = tuple(active.events)
+
+    clock.now = DEFAULT_LIMITS.job_ttl_seconds
+    registry.cleanup()
+    registry.cleanup()
+
+    assert set(registry.jobs) == {recent.job_id, active.job_id}
+    assert all(job.terminal_event is None and not job.events and job.log_count == 0 for job in expired)
+    assert all(reader.closed for reader in readers)
+    assert registry.active_id == active.job_id and registry.subscribers == 1
+    assert recent.terminal_event == recent_terminal
+    assert tuple(active.events) == active_events and not active_reader.closed
+    assert_log_accounting(active, [active_reader])
+    assert response_events(asyncio.run(collect_response(registry, recent))) == [done()]
+    registry.emit(active, done())
+    assert response_events(asyncio.run(collect_subscription_response(registry, active_reader))) == [
+        {"type": "log", "message": "Текущая строка"}, done(),
+    ]
+    assert registry.subscribers == 0
 
 
 def test_thirty_two_slots_are_retained_and_retry_after_tracks_nearest_expiry():
@@ -155,8 +195,9 @@ def test_thirty_two_slots_are_retained_and_retry_after_tracks_nearest_expiry():
         jobs.append(job)
     original = {job.job_id: job.terminal_event for job in jobs}
     clock.now = 31.25
+    options, reservation = HeavyReference(), HeavyReference()
     with pytest.raises(WebError) as failure:
-        registry.add(HeavyReference(), HeavyReference())
+        registry.add(options, reservation)
     assert (failure.value.status_code, failure.value.code) == (429, "jobs_full")
     assert failure.value.headers["Retry-After"] == "1769"
     assert {job_id: job.terminal_event for job_id, job in registry.jobs.items()} == original
@@ -269,12 +310,9 @@ def test_cancelling_stream_frees_subscriber_and_keeps_active_job(version):
         task = asyncio.create_task(response(scope(version), pending_receive, send))
         await asyncio.wait_for(entered.wait(), 1)
         task.cancel()
-        try:
+        with pytest.raises((asyncio.CancelledError, BaseExceptionGroup)) as failure:
             await task
-        except BaseException as error:
-            assert all(isinstance(leaf, asyncio.CancelledError) for leaf in exception_leaves(error))
-        else:
-            pytest.fail("Отмена подписки не должна исчезать без уведомления вызывающей стороны.")
+        assert all(isinstance(leaf, asyncio.CancelledError) for leaf in exception_leaves(failure.value))
 
     asyncio.run(cancel_response())
     assert registry.subscribers == 0
@@ -502,8 +540,9 @@ def test_unexpected_exception_in_group_is_not_silenced_and_subscriber_released(v
         response = JobStreamResponse(registry, subscription)
         await response(scope(version), pending_receive, send)
 
+    response_failure = grouped_failure()
     with pytest.raises(ExceptionGroup) as failure:
-        asyncio.run(grouped_failure())
+        asyncio.run(response_failure)
     leaves = exception_leaves(failure.value)
     assert len(leaves) == 1 and isinstance(leaves[0], RuntimeError)
     assert registry.subscribers == job.readers == job.log_count == job.log_size == 0
@@ -996,8 +1035,9 @@ def test_iterator_close_failure_does_not_leak_subscription(version):
 
         await response(scope(version), pending_receive, send)
 
+    closing_response = close_fails()
     with pytest.raises(RuntimeError, match="Ошибка закрытия итератора"):
-        asyncio.run(close_fails())
+        asyncio.run(closing_response)
     assert subscription.closed and subscription.in_flight is None
     assert job.readers == job.log_count == job.log_size == registry.subscribers == 0
     registry.unsubscribe(subscription)

@@ -5,18 +5,20 @@ import hashlib
 import io
 import json
 import logging
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from PIL import Image
+from PIL import Image, PngImagePlugin
 from starlette.datastructures import Headers, UploadFile
 from starlette.requests import Request
 from starlette.responses import Response
 
 from ocr_local.web import app as web_app
 from ocr_local.web import request_limits
+from ocr_local.web import uploads as web_uploads
 from ocr_local.web.errors import WebError
 from ocr_local.web.limits import DEFAULT_LIMITS, MIB
 from ocr_local.web.request_limits import RequestLimits
@@ -275,6 +277,402 @@ def test_stage_image_respects_combined_form_and_copy_quota(workspace, extra, all
     asyncio.run(stage())
     assert file.file.closed and snapshot([form_path]) == before
     assert sorted(path.name for path in workspace.path.iterdir()) == [".owner", form_path.name]
+
+
+def staging_input(workspace):
+    content = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(content, format="PNG")
+    data = content.getvalue()
+    form_path = workspace.new_path("form", ".part")
+    form_path.write_bytes(data)
+    foreign = [workspace.path / "notes.txt", workspace.path.parent / "original.png",
+               workspace.path.parent / "result.txt", workspace.path.parent / "cache.json"]
+    for path in foreign:
+        path.write_bytes(b"existing user data")
+    workspace.limits = replace(workspace.limits, temp_bytes=2 * len(data))
+    protected = [workspace.path / ".owner", form_path, *foreign]
+    return UploadFile(form_path.open("rb"), filename="scan.PNG"), data, snapshot(protected)
+
+
+def assert_staging_preserved(workspace, before):
+    assert snapshot(before) == before
+    expected = {path.name for path in before if path.parent == workspace.path}
+    assert {path.name for path in workspace.path.iterdir()} == expected
+
+
+class StageGate:
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
+        self.loop_thread = threading.get_ident()
+        self.entered = asyncio.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+
+    def wait(self):
+        assert threading.get_ident() != self.loop_thread
+        self.loop.call_soon_threadsafe(self.entered.set)
+        if not self.release.wait(timeout=5):
+            raise TimeoutError("Тест не освободил подготовку изображения")
+        self.finished.set()
+
+
+class GatedWriter:
+    def __init__(self, handle, gate):
+        self.handle, self.gate = handle, gate
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return self.handle.__exit__(*args)
+
+    def write(self, chunk):
+        self.gate.wait()
+        return self.handle.write(chunk)
+
+    def flush(self):
+        self.handle.flush()
+
+
+def install_stage_gate(monkeypatch, phase, gate):
+    if phase == "write":
+        original_open = Path.open
+
+        def gated_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            return GatedWriter(handle, gate) if mode == "xb" else handle
+
+        monkeypatch.setattr(Path, "open", gated_open)
+    else:
+        original_verify = PngImagePlugin.PngImageFile.verify
+
+        def gated_verify(image):
+            gate.wait()
+            original_verify(image)
+
+        monkeypatch.setattr(PngImagePlugin.PngImageFile, "verify", gated_verify)
+
+
+async def loop_checkpoint():
+    reached = asyncio.Event()
+    asyncio.get_running_loop().call_soon(reached.set)
+    await reached.wait()
+
+
+@pytest.mark.parametrize("worker_fails", [False, True])
+def test_worker_wait_reraises_cancellation_after_thread_finishes(worker_fails):
+    async def scenario():
+        gate = StageGate()
+        failure = OSError("Ошибка рабочего потока")
+
+        def worker():
+            gate.wait()
+            if worker_fails:
+                raise failure
+            return "готово"
+
+        future = asyncio.get_running_loop().run_in_executor(None, worker)
+        task = asyncio.create_task(web_uploads._wait_for_worker(future))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            for number in range(1000):
+                task.cancel(f"отмена {number}")
+                await loop_checkpoint()
+                assert not task.done() and not future.done()
+        finally:
+            gate.release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await asyncio.wait_for(task, timeout=2)
+        assert caught.value.args == ("отмена 999",)
+        assert future.done() and not future.cancelled() and gate.finished.is_set()
+        if worker_fails:
+            assert future.exception() is failure and caught.value.__cause__ is failure
+        else:
+            assert future.result() == "готово"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("worker_fails", [False, True])
+def test_worker_wait_accepts_already_completed_future(worker_fails):
+    async def scenario():
+        future = asyncio.get_running_loop().create_future()
+        if worker_fails:
+            failure = OSError("Ошибка завершённого рабочего потока")
+            future.set_exception(failure)
+            with pytest.raises(OSError) as caught:
+                await web_uploads._wait_for_worker(future)
+            assert caught.value is failure
+        else:
+            future.set_result("готово")
+            assert await web_uploads._wait_for_worker(future) == "готово"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("phase", ["write", "verify"])
+def test_slow_staging_keeps_event_loop_responsive(workspace, monkeypatch, phase):
+    file, data, before = staging_input(workspace)
+
+    async def scenario():
+        gate = StageGate()
+        install_stage_gate(monkeypatch, phase, gate)
+        task = asyncio.create_task(stage_image(file, workspace))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            await loop_checkpoint()
+            assert not task.done() and not gate.finished.is_set()
+        finally:
+            gate.release.set()
+        staged, digest, suffix = await asyncio.wait_for(task, timeout=2)
+        assert staged.read_bytes() == data
+        assert digest == hashlib.sha256(data).hexdigest() and suffix == ".png"
+        assert gate.finished.is_set() and not file.file.closed
+        staged.unlink()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+@pytest.mark.parametrize("phase", ["write", "verify"])
+@pytest.mark.parametrize("cancellations", [1, 2])
+def test_staging_cancellation_joins_worker_before_cleanup(workspace, monkeypatch, phase, cancellations):
+    file, _, before = staging_input(workspace)
+    cleanup_threads = []
+    original_unlink = Path.unlink
+
+    async def scenario():
+        gate = StageGate()
+        install_stage_gate(monkeypatch, phase, gate)
+
+        def checked_unlink(path, *args, **kwargs):
+            if path.name.startswith("image-"):
+                assert gate.finished.is_set()
+                cleanup_threads.append(threading.get_ident())
+                assert cleanup_threads[-1] != gate.loop_thread
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", checked_unlink)
+        task = asyncio.create_task(stage_image(file, workspace))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            for _ in range(cancellations):
+                task.cancel()
+                await loop_checkpoint()
+                assert not task.done() and not file.file.closed and not cleanup_threads
+                assert list(workspace.path.glob("image-*.png"))
+        finally:
+            gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert gate.finished.is_set() and cleanup_threads
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+def test_cancel_all_tasks_waits_for_staging_thread_before_cleanup(workspace, monkeypatch):
+    file, _, before = staging_input(workspace)
+    original_open, original_unlink = Path.open, Path.unlink
+    writers, premature_cleanup = [], []
+
+    async def scenario():
+        gate = StageGate()
+
+        loop = asyncio.get_running_loop()
+        original_executor = loop.run_in_executor
+        executor_futures = []
+
+        def observed_executor(executor, function, *args):
+            future = original_executor(executor, function, *args)
+            executor_futures.append(future)
+            return future
+
+        def gated_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            if mode != "xb":
+                return handle
+            writers.append(handle)
+            return GatedWriter(handle, gate)
+
+        def checked_unlink(path, *args, **kwargs):
+            if path.name.startswith("image-") and any(not writer.closed for writer in writers):
+                premature_cleanup.append(path)
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", gated_open)
+        monkeypatch.setattr(Path, "unlink", checked_unlink)
+        monkeypatch.setattr(loop, "run_in_executor", observed_executor)
+        staging_task = asyncio.create_task(stage_image(file, workspace))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            assert len(executor_futures) == 1 and writers and all(not writer.closed for writer in writers)
+            worker_future = executor_futures[0]
+            for task in asyncio.all_tasks():
+                if task is not asyncio.current_task():
+                    task.cancel()
+            assert not worker_future.cancelled() and not worker_future.done()
+            await loop_checkpoint()
+            await loop_checkpoint()
+            assert not staging_task.done() and not premature_cleanup
+            assert not worker_future.done() and all(not writer.closed for writer in writers)
+        finally:
+            gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(staging_task, timeout=2)
+        assert worker_future.done() and not worker_future.cancelled()
+        assert all(writer.closed for writer in writers) and not premature_cleanup
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+def test_cancellation_after_worker_success_removes_unclaimed_image(workspace, monkeypatch):
+    file, _, before = staging_input(workspace)
+    original_run = web_uploads._ImageStaging.run
+    original_unlink = Path.unlink
+    completed = threading.Event()
+
+    async def scenario():
+        loop = asyncio.get_running_loop()
+        gate = StageGate()
+
+        def gated_unlink(path, *args, **kwargs):
+            if path.name.startswith("image-"):
+                assert completed.is_set()
+                gate.wait()
+            return original_unlink(path, *args, **kwargs)
+
+        def cancel_after_success(staging):
+            result = original_run(staging)
+            completed.set()
+            loop.call_soon_threadsafe(task.cancel)
+            return result
+
+        monkeypatch.setattr(web_uploads._ImageStaging, "run", cancel_after_success)
+        monkeypatch.setattr(Path, "unlink", gated_unlink)
+        task = asyncio.create_task(stage_image(file, workspace))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            task.cancel()
+            await loop_checkpoint()
+            assert not task.done() and list(workspace.path.glob("image-*.png"))
+        finally:
+            gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert completed.is_set()
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+@pytest.mark.parametrize("phase", ["write", "verify"])
+def test_staging_failure_cleans_only_its_copy(workspace, monkeypatch, phase):
+    file, _, before = staging_input(workspace)
+
+    if phase == "write":
+        original_open = Path.open
+
+        class FailingWriter(GatedWriter):
+            def write(self, chunk):
+                self.handle.write(chunk[:1])
+                self.handle.flush()
+                raise OSError("Ошибка записи")
+
+        def failing_open(path, mode="r", *args, **kwargs):
+            handle = original_open(path, mode, *args, **kwargs)
+            return FailingWriter(handle, None) if mode == "xb" else handle
+
+        monkeypatch.setattr(Path, "open", failing_open)
+        expected = OSError
+    else:
+        def fail_verify(image):
+            raise ValueError("Повреждённое изображение")
+
+        monkeypatch.setattr(PngImagePlugin.PngImageFile, "verify", fail_verify)
+        expected = WebError
+
+    async def scenario():
+        with pytest.raises(expected) as caught:
+            await stage_image(file, workspace)
+        if phase == "verify":
+            assert caught.value.code == "invalid_image" and caught.value.status_code == 400
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+def test_staging_open_failure_preserves_existing_candidate(workspace, monkeypatch):
+    file, _, before = staging_input(workspace)
+    collision = workspace.path / ("image-" + "a" * 32 + ".png")
+    collision.write_bytes(b"existing candidate")
+    before.update(snapshot([collision]))
+    monkeypatch.setattr(workspace, "new_path", lambda kind, suffix: collision)
+
+    async def scenario():
+        with pytest.raises(FileExistsError):
+            await stage_image(file, workspace)
+
+    try:
+        asyncio.run(scenario())
+    finally:
+        file.file.close()
+    assert_staging_preserved(workspace, before)
+
+
+@pytest.mark.parametrize("phase", ["write", "verify"])
+def test_cancel_during_staging_closes_form_only_after_worker(upload_handler, monkeypatch, tmp_path, phase):
+    workspace, parsers, middleware = upload_handler
+    content = io.BytesIO()
+    Image.new("RGB", (2, 2), "white").save(content, format="PNG")
+    data = content.getvalue()
+    workspace.limits = replace(workspace.limits, temp_bytes=2 * len(data))
+    original = tmp_path / "user-result.txt"
+    original.write_text("Существующий результат", encoding="utf-8")
+    before = snapshot([original])
+
+    async def scenario():
+        gate = StageGate()
+        install_stage_gate(monkeypatch, phase, gate)
+
+        async def receive():
+            return {"type": "http.request", "body": FILE_HEADER + data + FILE_END, "more_body": False}
+
+        async def send(message):
+            pytest.fail("Отменённая загрузка не должна отправлять ответ")
+
+        task = asyncio.create_task(middleware(request_scope(), receive, send))
+        try:
+            await asyncio.wait_for(gate.entered.wait(), timeout=2)
+            task.cancel()
+            await loop_checkpoint()
+            assert not task.done() and middleware.upload_slot.locked()
+            assert all(not handle.closed for parser in parsers for handle in parser._files_to_close_on_error)
+        finally:
+            gate.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+    asyncio.run(scenario())
+    assert not middleware.upload_slot.locked()
+    assert_clean(workspace, parsers)
+    assert snapshot([original]) == before
 
 
 @pytest.mark.parametrize("tail", [

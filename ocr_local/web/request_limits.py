@@ -33,34 +33,37 @@ class RequestLimits:
                     raise WebError("upload_busy", 429, "Другое изображение уже загружается. Повторите позже.")
             limit = self.limits.total_body_bytes if upload else self.limits.json_bytes
             self._check_declared_length(scope, limit)
-            started, last_data, received = time.monotonic(), time.monotonic(), 0
-
-            async def bounded_receive():
-                nonlocal received, last_data
-                remaining = min(self.limits.upload_total_seconds - (time.monotonic() - started),
-                                self.limits.upload_idle_seconds - (time.monotonic() - last_data))
-                if remaining <= 0:
-                    raise WebError("upload_timeout", 408, "Истекло время приёма изображения или запроса.")
-                try:
-                    message = await asyncio.wait_for(receive(), timeout=remaining)
-                except TimeoutError as exc:
-                    raise WebError("upload_timeout", 408, "Истекло время приёма изображения или запроса.") from exc
-                if message["type"] == "http.request":
-                    body = message.get("body", b"")
-                    received += len(body)
-                    if received > limit:
-                        raise WebError("request_too_large", 413, "Размер запроса превышает допустимый предел.")
-                    if body:
-                        last_data = time.monotonic()
-                return message
-
-            await self.app(scope, bounded_receive, send)
+            await self.app(scope, self._bounded_receive(receive, limit), send)
         except WebError as exc:
             status, payload = public_error(exc, self.logger)
             await JSONResponse(payload, status_code=status)(scope, receive, send)
         finally:
             if acquired:
                 self.upload_slot.release()
+
+    def _bounded_receive(self, receive, limit: int):
+        started, last_data, received = time.monotonic(), time.monotonic(), 0
+
+        async def bounded_receive():
+            nonlocal received, last_data
+            remaining = min(self.limits.upload_total_seconds - (time.monotonic() - started),
+                            self.limits.upload_idle_seconds - (time.monotonic() - last_data))
+            if remaining <= 0:
+                raise WebError("upload_timeout", 408, "Истекло время приёма изображения или запроса.")
+            try:
+                message = await asyncio.wait_for(receive(), timeout=remaining)
+            except TimeoutError as exc:
+                raise WebError("upload_timeout", 408, "Истекло время приёма изображения или запроса.") from exc
+            if message["type"] == "http.request":
+                body = message.get("body", b"")
+                received += len(body)
+                if received > limit:
+                    raise WebError("request_too_large", 413, "Размер запроса превышает допустимый предел.")
+                if body:
+                    last_data = time.monotonic()
+            return message
+
+        return bounded_receive
 
     @staticmethod
     def _check_declared_length(scope, limit: int) -> None:

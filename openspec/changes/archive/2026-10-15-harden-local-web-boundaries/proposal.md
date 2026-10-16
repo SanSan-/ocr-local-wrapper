@@ -37,6 +37,6 @@ OCR предназначен для работы только на компью�
 
 Основание — четыре группы мер по [облачному разбору](https://chatgpt.com/mcp-app/connector_openai_defense_factory/open_defense_factory#/runs/wfr_9d0ed7fda66f55dfa4c04b6dee40d0e39fe88ad1586ef9b6ea7ed0e1faa98e79),
 проверенные по текущим исходникам, и выбранный пользователем режим «только этот компьютер».
-Изменение опирается на уже выполненный [fix-web-input-and-sse-lock](../../fix-web-input-and-sse-lock/proposal.md):
+Изменение опирается на уже выполненный [fix-web-input-and-sse-lock](../2026-10-16-fix-web-input-and-sse-lock/proposal.md):
 отказ для пробельного промпта, блокировка интерфейса при разрыве и повторная доставка `done` сохраняются.
 Существующие результаты OCR не мигрируются и автоматически не удаляются.

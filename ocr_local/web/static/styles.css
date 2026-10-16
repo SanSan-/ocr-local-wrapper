@@ -50,6 +50,18 @@ body {
   cursor: pointer;
   background: var(--drop-bg);
   border: 2px dashed transparent;
+  padding: 0;
+  font: inherit;
+  color: inherit;
+}
+
+.drop-zone:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -4px;
+}
+
+.drop-zone:disabled {
+  cursor: not-allowed;
 }
 
 .drop-zone.drag-over {
@@ -75,12 +87,14 @@ body {
 }
 
 .upload-title {
+  display: block;
   font-size: 18px;
   font-weight: 600;
   color: var(--ink);
 }
 
 .upload-hint {
+  display: block;
   margin-top: 6px;
   font-size: 13px;
 }

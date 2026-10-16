@@ -11,11 +11,12 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 
 _instances: weakref.WeakSet[LocalWebSecurity] = weakref.WeakSet()
+_LOCAL_ORIGINS = {"127.0.0.1": "http://127.0.0.1", "::1": "http://[::1]"}
 
 
 def validate_listener_config(host: str, port: int) -> None:
     """Проверяет адрес до создания приложения и открытия сокета."""
-    if host not in ("127.0.0.1", "::1"):
+    if host not in _LOCAL_ORIGINS:
         raise ValueError("Допустим только локальный адрес 127.0.0.1 или ::1.")
     if type(port) is not int or not 1 <= port <= 65535:
         raise ValueError("Порт должен быть целым числом от 1 до 65535.")
@@ -29,8 +30,9 @@ class _SecretRedactingFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
         # Исключение форматируется раньше замены: секрет не остаётся в traceback.
         rendered = self.original.format(record)
-        for instance in list(_instances):
-            rendered = rendered.replace(instance._secret, "[СКРЫТО]")
+        secrets_to_redact = tuple(instance._secret for instance in _instances)
+        for secret in secrets_to_redact:
+            rendered = rendered.replace(secret, "[СКРЫТО]")
         return rendered
 
 
@@ -55,7 +57,7 @@ class LocalWebSecurity:
         self.app = app
         authority_host = f"[{host}]" if host == "::1" else host
         self.authority = f"{authority_host}:{port}".encode("ascii")
-        self.origin = b"http://" + self.authority
+        self.origin = f"{_LOCAL_ORIGINS[host]}:{port}".encode("ascii")
         self.cookie_name = f"ocr_local_{port}"
         self._secret = secrets.token_hex(32)
         _instances.add(self)
@@ -82,42 +84,53 @@ class LocalWebSecurity:
                     values.append(token if separator else "")
         return len(values) <= 1, values[0] if values else None
 
-    def _allowed(self, scope: Scope) -> tuple[bool, bool]:
+    def _trusted_headers(self, scope: Scope) -> list[tuple[bytes, bytes]] | None:
         if not self._local_peer(scope):
-            return False, False
+            return None
         headers = [(key.lower(), value) for key, value in scope.get("headers", [])]
         if any(key == b"forwarded" or key.startswith(b"x-forwarded-") for key, _ in headers):
-            return False, False
+            return None
         hosts = [value for key, value in headers if key == b"host"]
         origins = [value for key, value in headers if key == b"origin"]
         if hosts != [self.authority] or len(origins) > 1:
-            return False, False
+            return None
         if origins and origins[0] != self.origin:
-            return False, False
+            return None
         method = scope["method"]
         if method not in ("GET", "HEAD", "OPTIONS") and not origins:
-            return False, False
+            return None
+        return headers
 
+    @staticmethod
+    def _fetch_allowed(headers: list[tuple[bytes, bytes]], bootstrap: bool) -> bool:
         metadata = {}
         for key, value in headers:
             if key.startswith(b"sec-fetch-"):
                 if key in metadata:
-                    return False, False
+                    return False
                 metadata[key] = value
         site = metadata.get(b"sec-fetch-site")
         if site is not None and site not in (b"same-origin", b"none"):
+            return False
+
+        if bootstrap and metadata:
+            return (site in (b"none", b"same-origin")
+                    and metadata.get(b"sec-fetch-mode") == b"navigate"
+                    and metadata.get(b"sec-fetch-dest") == b"document")
+        return True
+
+    def _allowed(self, scope: Scope) -> tuple[bool, bool]:
+        headers = self._trusted_headers(scope)
+        if headers is None:
+            return False, False
+        method, path = scope["method"], scope.get("path", "")
+        bootstrap = method == "GET" and path == "/"
+        if not self._fetch_allowed(headers, bootstrap):
             return False, False
 
         unambiguous, cookie = self._cookie(headers)
         if not unambiguous:
             return False, False
-        path = scope.get("path", "")
-        bootstrap = method == "GET" and path == "/"
-        if bootstrap and metadata:
-            if (site not in (b"none", b"same-origin")
-                    or metadata.get(b"sec-fetch-mode") != b"navigate"
-                    or metadata.get(b"sec-fetch-dest") != b"document"):
-                return False, False
         static = path.startswith("/static/") and not any(
             part in (".", "..") for part in path.split("/")
         ) and "\\" not in path

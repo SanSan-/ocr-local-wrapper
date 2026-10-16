@@ -212,7 +212,9 @@ def test_ipv6_and_configured_port_are_canonical():
 
 def test_secret_redaction_in_formatted_arguments_and_exception():
     app = LocalWebSecurity(ProbeApp())
+    second_app = LocalWebSecurity(ProbeApp())
     token = session(app).split(b"=", 1)[1].decode()
+    second_token = session(second_app).split(b"=", 1)[1].decode()
     output = io.StringIO()
     logger = logging.getLogger("ocr_local.security_test")
     handler = logging.StreamHandler(output)
@@ -227,13 +229,13 @@ def test_secret_redaction_in_formatted_arguments_and_exception():
     try:
         install_secret_log_redaction()
         install_secret_log_redaction()
-        logger.warning("Cookie: %s", token)
+        logger.warning("Cookies: %s %s", token, second_token)
         try:
             raise ValueError("diagnostic " + token)
         except ValueError:
             logger.exception("Exception with %s", {"cookie": token})
         rendered = output.getvalue()
-        assert token not in rendered
+        assert token not in rendered and second_token not in rendered
         assert "[СКРЫТО]" in rendered and "Traceback" in rendered and "diagnostic" in rendered
     finally:
         for item, formatter in originals.items():

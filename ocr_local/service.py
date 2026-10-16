@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Protocol
 
 from ocr_local.exceptions import OcrModelError
 from ocr_local.model_profiles import get_profile, resolve_options, settings_identity
@@ -23,6 +23,14 @@ SPECIAL_TOKENS = (
     "<|endoftext|>", "<|begin_of_image|>", "<|end_of_image|>", "<|image|>",
     "<|begin_of_video|>", "<|end_of_video|>", "<|video|>",
 )
+
+
+class _TokenSequence(Protocol):
+    """Общие операции над токенами списка и тензора без загрузки Torch."""
+
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int) -> object: ...
 
 
 def run_ocr(
@@ -119,7 +127,7 @@ def recognize_image_text(
     return cleaned
 
 
-def _limit_reached(tokens: object, limit: int, model: object) -> bool:
+def _limit_reached(tokens: _TokenSequence, limit: int, model: object) -> bool:
     if len(tokens) < limit:
         return False
     eos = getattr(getattr(model, "generation_config", None), "eos_token_id", None)
@@ -161,7 +169,7 @@ def _input_token_length(inputs: object) -> int:
         raise OcrModelError("Не удалось определить длину входного промпта модели.") from exc
 
 
-def _slice_generated_tokens(generated_ids: object, input_length: int) -> object:
+def _slice_generated_tokens(generated_ids: object, input_length: int) -> _TokenSequence:
     try:
         return generated_ids[0][input_length:]
     except (TypeError, IndexError) as exc:

@@ -5,6 +5,7 @@ import json
 import os
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
+from typing import cast
 
 from ocr_local.exceptions import OcrValidationError
 from ocr_local.models import OcrOptions
@@ -12,6 +13,8 @@ from ocr_local.utils.env_utils import get_default_model_path
 
 MAX_NEW_TOKENS = 32768
 MAX_PIXELS = 16777216
+PADDLE_MODEL_ID = "paddleocr-vl-1.6"
+MODEL_CONFIG_NAME = "config.json"
 
 
 @dataclass(frozen=True)
@@ -33,8 +36,8 @@ PROFILES = {
         "glm-ocr", "GLM-OCR", "glm_ocr", "OCR_GLM_MODEL_PATH",
         "Text Recognition:", 8192, 2007040, 12544,
     ),
-    "paddleocr-vl-1.6": ModelProfile(
-        "paddleocr-vl-1.6", "PaddleOCR-VL-1.6", "paddleocr_vl", "OCR_PADDLE_MODEL_PATH",
+    PADDLE_MODEL_ID: ModelProfile(
+        PADDLE_MODEL_ID, "PaddleOCR-VL-1.6", "paddleocr_vl", "OCR_PADDLE_MODEL_PATH",
         "OCR:", 2048, 1003520, 112896,
     ),
 }
@@ -49,7 +52,7 @@ def get_profile(model_id: str) -> ModelProfile:
 
 def detect_model_id(path: Path) -> str:
     """Определяет семейство без загрузки весов, в том числе по имени отсутствующего каталога."""
-    config_path = path / "config.json"
+    config_path = path / MODEL_CONFIG_NAME
     if config_path.is_file():
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
@@ -61,7 +64,7 @@ def detect_model_id(path: Path) -> str:
                 if profile.model_type == model_type:
                     return profile.id
             raise OcrValidationError(f"Неподдерживаемый model_type: {model_type}")
-    return "paddleocr-vl-1.6" if "paddleocr" in path.name.lower() else "glm-ocr"
+    return PADDLE_MODEL_ID if "paddleocr" in path.name.lower() else "glm-ocr"
 
 
 def get_model_path(model_id: str) -> Path:
@@ -82,7 +85,7 @@ def resolve_options(options: OcrOptions) -> OcrOptions:
     model_id = options.model_id or detect_model_id(options.model_path or get_default_model_path())
     profile = get_profile(model_id)
     path = (options.model_path or get_model_path(model_id)).expanduser().resolve()
-    if (path / "config.json").is_file() and detect_model_id(path) != model_id:
+    if (path / MODEL_CONFIG_NAME).is_file() and detect_model_id(path) != model_id:
         raise OcrValidationError(f"Каталог {path} не соответствует модели {profile.name}.")
     prompt = profile.prompt if options.prompt is None else options.prompt
     tokens = profile.max_new_tokens if options.max_new_tokens is None else options.max_new_tokens
@@ -93,8 +96,9 @@ def resolve_options(options: OcrOptions) -> OcrOptions:
         raise OcrValidationError(f"max-new-tokens должен быть от 1 до {MAX_NEW_TOKENS}.")
     if type(pixels) is not int or not profile.min_pixels <= pixels <= MAX_PIXELS:
         raise OcrValidationError(f"max-pixels должен быть от {profile.min_pixels} до {MAX_PIXELS}.")
-    return replace(options, model_id=model_id, model_path=path, prompt=prompt,
-                   max_new_tokens=tokens, max_pixels=pixels)
+    # replace сохраняет конкретный тип options и все незаменённые поля.
+    return cast(OcrOptions, replace(options, model_id=model_id, model_path=path, prompt=prompt,
+                                   max_new_tokens=tokens, max_pixels=pixels))
 
 
 def settings_identity(options: OcrOptions) -> dict[str, object]:
@@ -120,7 +124,7 @@ def model_catalog() -> dict[str, object]:
     items = []
     for profile in PROFILES.values():
         path = get_model_path(profile.id).expanduser().resolve()
-        required = ("config.json", "model.safetensors", "tokenizer.json")
+        required = (MODEL_CONFIG_NAME, "model.safetensors", "tokenizer.json")
         available = all((path / name).is_file() for name in required)
         item = asdict(profile)
         item.update(path=str(path), available=available)

@@ -9,7 +9,7 @@ import time
 from contextlib import asynccontextmanager, suppress
 from dataclasses import asdict, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -199,7 +199,7 @@ def _make_options(image_path: Path, settings: ModelSettings) -> OcrOptions:
         allow_cpu_fallback=getattr(settings, "allow_cpu_fallback", True),
     ))
     name = f"{image_path.stem}.{options.model_id}.{settings_fingerprint(options)[:16]}.txt"
-    return replace(options, output_path=image_path.with_name(name))
+    return cast(OcrOptions, replace(options, output_path=image_path.with_name(name)))
 
 
 def _public_settings(settings: dict) -> dict:
@@ -325,7 +325,7 @@ def _resolve_upload_id(upload_id: str) -> Path:
     return candidate
 
 
-async def _error_response(request: Request, exc: Exception):
+def _error_response(request: Request, exc: Exception):
     original = exc
     if isinstance(exc, RequestValidationError):
         exc = WebError("invalid_request", 422, "Неверные поля или параметры запроса.")

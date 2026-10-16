@@ -129,6 +129,7 @@ def test_cancellation_and_receive_failure_release_upload_slot(failure):
     async def send(message):
         pytest.fail("Ответ не ожидается после отмены транспорта")
 
+    request = app(scope(), receive, send)
     with pytest.raises(failure):
-        asyncio.run(app(scope(), receive, send))
+        asyncio.run(request)
     assert not app.upload_slot.locked()

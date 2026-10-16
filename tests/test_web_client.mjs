@@ -6,6 +6,8 @@ import vm from "node:vm";
 
 const sourcePath = process.env.OCR_CLIENT_SOURCE || new URL("../ocr_local/web/static/app.js", import.meta.url);
 const source = await readFile(sourcePath, "utf8");
+const htmlPath = process.env.OCR_CLIENT_HTML || new URL("../ocr_local/web/static/index.html", import.meta.url);
+const html = await readFile(htmlPath, "utf8");
 const catalog = {
   default_model_id: "paddleocr-vl-1.6", max_new_tokens_limit: 32768, max_pixels_limit: 16777216,
   models: [
@@ -20,14 +22,25 @@ const imageItem = (type = "image/png", text = "image") => ({
   kind: "file", type, getAsFile: () => new File([text], "image", {type}),
 });
 
-function element() {
+function markupElement(id) {
+  const match = html.match(new RegExp(`<([a-z][\\w-]*)\\b([^>]*\\bid="${id}"[^>]*)>`, "i"));
+  assert.ok(match, "Элемент отсутствует в HTML: " + id);
+  const attributes = new Map(Array.from(match[2].matchAll(/([:\w-]+)(?:="([^"]*)")?/g),
+    item => [item[1], item[2] ?? ""]));
+  return {tagName: match[1].toUpperCase(), attributes};
+}
+
+function element({tagName = "", attributes = new Map()} = {}) {
   const listeners = new Map();
   return {
-    value: "", textContent: "", hidden: true, disabled: false, checked: false, valid: true, files: [],
-    addEventListener(name, handler) { listeners.set(name, handler); },
+    tagName, value: "", textContent: "", hidden: attributes.has("hidden"),
+    disabled: attributes.has("disabled"), checked: false, valid: true, files: [], clicks: 0,
+    addEventListener(name, handler, options = {}) { listeners.set(name, {handler, once: options.once}); },
     emit(name, fields = {}) {
-      const event = {defaultPrevented: false, preventDefault() {this.defaultPrevented = true;}, ...fields};
-      listeners.get(name)?.(event);
+      const event = {target: this, defaultPrevented: false, preventDefault() {this.defaultPrevented = true;}, ...fields};
+      const listener = listeners.get(name);
+      if (listener?.once) listeners.delete(name);
+      listener?.handler(event);
       return event;
     },
     setAttribute(name, value) {this[name] = value;},
@@ -36,20 +49,31 @@ function element() {
     checkValidity() {return this.valid;},
     set innerHTML(value) {throw new Error("Разметка не должна исполняться: " + value);},
     insertAdjacentHTML() {throw new Error("Разметка не должна исполняться");},
-    click() {this.emit("click", {target: this});},
+    click() {if (!this.disabled) {this.clicks++; this.emit("click");}},
+    pressKey(key) {
+      const down = this.emit("keydown", {key});
+      if (this.tagName === "BUTTON" && key === "Enter" && !down.defaultPrevented) this.click();
+      const up = this.emit("keyup", {key});
+      if (this.tagName === "BUTTON" && key === " " && !down.defaultPrevented && !up.defaultPrevented) this.click();
+    },
     classList: {add() {}, remove() {}},
   };
 }
 
-async function client({models = () => json(catalog), upload, recognize, cached} = {}) {
+async function client({models = () => json(catalog), upload, recognize, cached,
+  readyState = "loading", autoReady = true} = {}) {
   const elements = new Map();
   const document = element();
-  document.getElementById = id => {
-    if (!elements.has(id)) elements.set(id, element());
+  document.readyState = readyState;
+  const el = id => {
+    if (!elements.has(id)) elements.set(id, element(markupElement(id)));
     return elements.get(id);
   };
+  document.getElementById = id => {
+    assert.notEqual(document.readyState, "loading", "Нельзя читать элементы до готовности DOM");
+    return el(id);
+  };
   document.createElement = element;
-  const el = id => document.getElementById(id);
   el("modelSettings").elements = ["modelSelect", "promptInput", "maxTokensInput", "maxPixelsInput",
     "quantizationInput", "forceInput", "resetSettingsBtn"].map(el);
   const calls = [];
@@ -76,13 +100,105 @@ async function client({models = () => json(catalog), upload, recognize, cached} 
     },
   });
   vm.runInContext(source, context, {filename: "app.js"});
+  const domReady = () => { document.readyState = "interactive"; document.emit("DOMContentLoaded"); };
+  if (autoReady && readyState === "loading") domReady();
   await settle();
   return {
-    el, calls, streams,
+    el, calls, streams, domReady,
     uploads: () => calls.filter(call => call.url === "/api/upload"),
     paste: items => document.emit("paste", {clipboardData: {items}}),
   };
 }
+
+test("Разметка использует доступную кнопку и отдельный скрытый выбор файла", () => {
+  const button = markupElement("dropZone");
+  const input = markupElement("fileInput");
+  assert.equal(button.tagName, "BUTTON");
+  assert.equal(button.attributes.get("type"), "button");
+  assert.ok(button.attributes.get("aria-label")?.trim());
+  assert.equal(button.attributes.has("tabindex"), false);
+  assert.equal(input.tagName, "INPUT");
+  assert.equal(input.attributes.get("type"), "file");
+  assert.ok(input.attributes.has("hidden"));
+  assert.ok(input.attributes.get("aria-label")?.trim());
+  const content = html.match(/<button\b[^>]*\bid="dropZone"[^>]*>([\s\S]*?)<\/button>/i)[1];
+  assert.doesNotMatch(content, /<(?:input|select|textarea|button|div)\b/i);
+});
+
+test("Поле результата имеет доступное имя в фактической разметке", () => {
+  const result = markupElement("resultText");
+  assert.equal(result.tagName, "TEXTAREA");
+  assert.equal(result.attributes.get("aria-label"), "Результат распознавания");
+});
+
+test("Инициализация ждёт DOM и получает каталог ровно один раз", async () => {
+  const c = await client({autoReady: false});
+  assert.equal(c.calls.length, 0);
+  assert.equal(c.el("dropZone").disabled, true);
+  c.domReady();
+  await settle();
+  assert.equal(c.calls.filter(call => call.url === "/api/models").length, 1);
+  assert.equal(c.el("modelSelect").value, catalog.default_model_id);
+  assert.equal(c.el("dropZone").disabled, false);
+  c.domReady();
+  await settle();
+  assert.equal(c.calls.length, 1);
+});
+
+test("Скрипт инициализирует уже готовый документ без ожидания нового события", async () => {
+  const c = await client({readyState: "complete"});
+  assert.equal(c.calls.filter(call => call.url === "/api/models").length, 1);
+  assert.equal(c.el("dropZone").disabled, false);
+  c.domReady();
+  await settle();
+  assert.equal(c.calls.length, 1);
+});
+
+for (const activation of ["click", "Enter", " "]) {
+  test("Кнопка открывает один выбор файла при активации " + JSON.stringify(activation), async () => {
+    const c = await client();
+    const button = c.el("dropZone");
+    if (activation === "click") button.click();
+    else button.pressKey(activation);
+    assert.equal(c.el("fileInput").clicks, 1);
+    assert.equal(c.uploads().length, 0);
+    assert.equal(c.calls.some(call => call.url === "/api/recognize"), false);
+  });
+}
+
+test("Выбор файла заблокирован до каталога, при загрузке, OCR и восстановлении SSE", async () => {
+  const models = deferred();
+  const upload = deferred();
+  const c = await client({models: () => models.promise, upload: () => upload.promise});
+  const assertBlocked = () => {
+    assert.equal(c.el("dropZone").disabled, true);
+    c.el("dropZone").click();
+    c.el("dropZone").pressKey("Enter");
+    c.el("dropZone").pressKey(" ");
+    assert.equal(c.el("fileInput").clicks, 0);
+  };
+  assertBlocked();
+  models.resolve(json(catalog));
+  await settle();
+  assert.equal(c.el("dropZone").disabled, false);
+  c.paste([imageItem()]);
+  assertBlocked();
+  upload.resolve(json({upload_id: "button-id.png", image_url: "/button.png", text: ""}));
+  await settle();
+  c.el("recognizeBtn").click();
+  await settle();
+  assertBlocked();
+  c.streams[0].onerror();
+  assertBlocked();
+  c.streams[0].onopen();
+  assertBlocked();
+  c.streams[0].onmessage({data: JSON.stringify({type: "done", status: "error", error: "Отказ OCR"})});
+  assert.equal(c.el("dropZone").disabled, false);
+  c.el("dropZone").pressKey("Enter");
+  assert.equal(c.el("fileInput").clicks, 1);
+  assert.equal(c.uploads().length, 1);
+  assert.equal(c.calls.filter(call => call.url === "/api/recognize").length, 1);
+});
 
 for (const [mime, extension] of [["image/png", "png"], ["image/jpeg", "jpg"], ["image/webp", "webp"], ["image/bmp", "bmp"]]) {
   test("Вставка " + mime + " передаёт один файл с параметрами и не запускает OCR", async () => {
@@ -147,6 +263,10 @@ test("До готовности каталога есть объяснение; 
 
 test("Отказ каталога сохраняется в объяснении недоступной вставки", async () => {
   const c = await client({models: () => json({detail: "Каталог недоступен"}, 503)});
+  assert.equal(c.el("dropZone").disabled, true);
+  c.el("dropZone").click();
+  c.el("dropZone").pressKey("Enter");
+  assert.equal(c.el("fileInput").clicks, 0);
   c.paste([imageItem()]);
   assert.match(c.el("statusText").textContent, /Каталог недоступен/);
   assert.match(c.el("statusText").textContent, /Вставка недоступна/);

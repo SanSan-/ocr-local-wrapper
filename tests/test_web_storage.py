@@ -122,11 +122,10 @@ def test_preflight_io_error_returns_safe_storage_failure_without_writes(storage,
         raise OSError("Private path in metadata failure")
 
     monkeypatch.setattr(budget, "_usage", fail_usage)
+    action, args = ((budget.reserve, (options,)) if operation == "reserve"
+                    else (budget.publish_upload, (temporary, "a" * 64, ".png")))
     with pytest.raises(WebError) as error:
-        if operation == "reserve":
-            budget.reserve(options)
-        else:
-            budget.publish_upload(temporary, "a" * 64, ".png")
+        action(*args)
     assert (error.value.code, error.value.status_code) == ("storage_unavailable", 507)
     assert "Private path" not in str(error.value)
     assert isinstance(error.value.__cause__, OSError)
@@ -236,8 +235,9 @@ def test_cache_without_write_and_existing_txt_read_remain_available_over_total_q
     assert result.text == "Кеш"
     assert budget.read_text(output) == "Моя правка"
     assert digest_files([output, budget.cache_file]) == before
+    force_options = replace(options, force=True)
     with pytest.raises(WebError, match="квоте"):
-        budget.reserve(replace(options, force=True))
+        budget.reserve(force_options)
 
 
 def test_force_reserves_only_positive_growth_and_does_not_repeat_file_count(storage):
@@ -318,8 +318,9 @@ def test_exact_serialized_json_checked_before_first_txt_write(storage, monkeypat
     budget.limits = replace(budget.limits, cache_entry_bytes=len(encoded.encode("utf-8")) - 1)
     reservation = budget.reserve(options)
     try:
+        loaded = fake_ocr(monkeypatch, text)
         with pytest.raises(WebError) as error:
-            service.run_ocr(options, loaded=fake_ocr(monkeypatch, text), storage_policy=reservation)
+            service.run_ocr(options, loaded=loaded, storage_policy=reservation)
     finally:
         reservation.release()
     assert error.value.code == "storage_quota_exceeded"
@@ -361,24 +362,27 @@ def test_old_large_file_is_rejected_without_opening_or_modifying_it(storage, mon
 
     with monkeypatch.context() as patch:
         patch.setattr(Path, "open", guarded_open)
+        action, args = ((budget.load_cache, ()) if artifact == "cache" else (budget.read_text, (path,)))
         with pytest.raises(WebError) as error:
-            budget.load_cache() if artifact == "cache" else budget.read_text(path)
+            action(*args)
     assert error.value.code == "stored_data_too_large"
     assert hashlib.sha256(path.read_bytes()).hexdigest() == before
     if artifact == "cache":
         output = options.input_path.with_suffix(".txt")
         output.write_text("TXT", encoding="utf-8")
         assert budget.read_text(output) == "TXT"
+        force_options = replace(options, force=True)
         with pytest.raises(WebError):
-            budget.reserve(replace(options, force=True))
+            budget.reserve(force_options)
 
 
 def test_invalid_existing_cache_is_not_discarded_by_web(storage):
     budget, options = storage
     budget.cache_file.write_text('{"legacy":', encoding="utf-8")
     before = digest_files([budget.cache_file])
+    force_options = replace(options, force=True)
     with pytest.raises(WebError) as error:
-        budget.reserve(replace(options, force=True))
+        budget.reserve(force_options)
     assert error.value.code == "cache_unavailable"
     assert digest_files([budget.cache_file]) == before
 
@@ -390,8 +394,9 @@ def test_growth_after_admission_rechecked_before_writing(storage, monkeypatch):
     manual.write_bytes(b"x" * budget.limits.result_bytes)
     before = digest_files([manual, options.input_path])
     try:
+        loaded = fake_ocr(monkeypatch, "Новый")
         with pytest.raises(WebError, match="квоте"):
-            service.run_ocr(options, loaded=fake_ocr(monkeypatch, "Новый"), storage_policy=reservation)
+            service.run_ocr(options, loaded=loaded, storage_policy=reservation)
     finally:
         reservation.release()
     assert not options.input_path.with_suffix(".txt").exists() and not budget.cache_file.exists()

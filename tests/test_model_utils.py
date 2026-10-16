@@ -80,8 +80,9 @@ def test_gpu_failure_obeys_cpu_policy(monkeypatch, fallback):
         assert loaded.quantized is False
         assert calls == ["cuda", "cpu"]
     else:
+        model_path = Path("model")
         with pytest.raises(OcrModelError, match="test GPU OOM"):
-            model_utils.load_model_components(Path("model"), False, False)
+            model_utils.load_model_components(model_path, False, False)
         assert calls == ["cuda"]
 
 

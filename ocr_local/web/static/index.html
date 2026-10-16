@@ -9,15 +9,15 @@
 <body>
   <main class="app-shell">
     <section class="image-pane">
-      <label id="dropZone" class="drop-zone" tabindex="0">
-        <input id="fileInput" type="file" accept=".jpg,.jpeg,.png,.webp,.bmp,image/*" hidden>
-        <div id="emptyState" class="empty-state">
-          <div class="upload-icon">+</div>
-          <div class="upload-title">Перетащите изображение</div>
-          <div class="upload-hint">или нажмите для выбора файла<br>Ctrl+V — вставить изображение<br>Файл размером до 25 МиБ</div>
-        </div>
+      <input id="fileInput" type="file" accept=".jpg,.jpeg,.png,.webp,.bmp,image/*" aria-label="Файл изображения" hidden disabled>
+      <button id="dropZone" class="drop-zone" type="button" aria-label="Выбрать изображение" disabled>
+        <span id="emptyState" class="empty-state">
+          <span class="upload-icon">+</span>
+          <span class="upload-title">Перетащите изображение</span>
+          <span class="upload-hint">или нажмите для выбора файла<br>Ctrl+V — вставить изображение<br>Файл размером до 25 МиБ</span>
+        </span>
         <img id="imagePreview" class="image-preview" alt="Загруженное изображение" hidden>
-      </label>
+      </button>
     </section>
     <section class="text-pane">
       <header class="toolbar">
@@ -51,7 +51,7 @@
       <div id="recoveryHint" class="metrics">После завершения результат доступен для восстановления связи в течение 30 минут.
         Уже показанный текст и сохранённые файлы остаются. После перезапуска приложения обновите страницу.</div>
       <div id="metricsText" class="metrics" aria-live="polite"></div>
-      <textarea id="resultText" class="result-text" spellcheck="false"></textarea>
+      <textarea id="resultText" class="result-text" spellcheck="false" aria-label="Результат распознавания"></textarea>
       <section class="log-panel">
         <div class="log-header">
           <span>Логи</span>

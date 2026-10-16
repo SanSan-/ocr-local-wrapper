@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import re
+import threading
 import uuid
+from contextlib import suppress
 from pathlib import Path
 
 from PIL import Image
@@ -53,8 +56,8 @@ class UploadParser(MultiPartParser):
     """Разбирает ровно один файл и ограниченное поле настроек в собственном хранилище."""
 
     def __init__(self, headers, stream, workspace: TemporaryUploads) -> None:
-        super().__init__(headers, stream, max_files=1, max_fields=1,
-                         max_part_size=workspace.limits.form_field_bytes)
+        super().__init__(headers, stream, max_files=1, max_fields=1)
+        self.max_part_size = workspace.limits.form_field_bytes
         self.workspace = workspace
         self.paths: list[Path] = []
         self.part_bytes = 0
@@ -118,36 +121,113 @@ class UploadParser(MultiPartParser):
             path.unlink(missing_ok=True)
 
 
-async def stage_image(file: UploadFile, workspace: TemporaryUploads) -> tuple[Path, str, str]:
-    suffix = Path(file.filename or "").suffix.lower()
-    if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
-        raise WebError("invalid_image", 400, "Неподдерживаемый формат изображения.")
-    path = workspace.new_path("image", suffix)
-    digest, size = hashlib.sha256(), 0
-    try:
+class _StagingCancelled(Exception):
+    """Рабочий поток прекращает подготовку по запросу отменённого обработчика."""
+
+
+class _ImageStaging:
+    """Владеет временной копией до передачи результата асинхронному обработчику."""
+
+    def __init__(self, file: UploadFile, workspace: TemporaryUploads) -> None:
+        self.file, self.workspace = file, workspace
+        self.cancelled = threading.Event()
+        self.path: Path | None = None
+
+    def check_cancelled(self) -> None:
+        if self.cancelled.is_set():
+            raise _StagingCancelled()
+
+    def cleanup(self) -> None:
+        if self.path is not None:
+            self.path.unlink(missing_ok=True)
+
+    def copy(self, path: Path) -> str:
+        digest, size = hashlib.sha256(), 0
         with path.open("xb") as output:
-            while chunk := await file.read(64 * 1024):
+            self.path = path
+            while True:
+                self.check_cancelled()
+                chunk = self.file.file.read(64 * 1024)
+                if not chunk:
+                    break
+                self.check_cancelled()
                 size += len(chunk)
-                if size > workspace.limits.image_bytes:
+                if size > self.workspace.limits.image_bytes:
                     raise WebError("request_too_large", 413, "Изображение превышает допустимый размер.")
-                workspace.check_size(len(chunk))
+                self.workspace.check_size(len(chunk))
                 output.write(chunk)
                 output.flush()
                 digest.update(chunk)
         if not size:
             raise WebError("invalid_image", 400, "Файл изображения пуст.")
+        return digest.hexdigest()
+
+    def run(self) -> tuple[Path, str, str]:
+        suffix = Path(self.file.filename or "").suffix.lower()
+        if suffix not in SUPPORTED_IMAGE_EXTENSIONS:
+            raise WebError("invalid_image", 400, "Неподдерживаемый формат изображения.")
+        self.check_cancelled()
+        path = self.workspace.new_path("image", suffix)
         try:
-            with Image.open(path) as image:
-                if image.width * image.height > workspace.limits.image_pixels:
-                    raise WebError("image_too_large", 413, "Изображение содержит слишком много пикселей.")
-                image.verify()
-        except WebError:
+            digest = self.copy(path)
+            self.check_cancelled()
+            _verify_image(path, self.workspace.limits)
+            self.check_cancelled()
+            return path, digest, suffix
+        except BaseException:
+            self.cleanup()
             raise
-        except Image.DecompressionBombError as exc:
-            raise WebError("image_too_large", 413, "Изображение содержит слишком много пикселей.") from exc
-        except Exception as exc:
-            raise WebError("invalid_image", 400, "Файл не читается как изображение.") from exc
-        return path, digest.hexdigest(), suffix
-    except BaseException:
-        path.unlink(missing_ok=True)
+
+
+def _verify_image(path: Path, limits: WebLimits) -> None:
+    try:
+        with Image.open(path) as image:
+            if image.width * image.height > limits.image_pixels:
+                raise WebError("image_too_large", 413, "Изображение содержит слишком много пикселей.")
+            image.verify()
+    except WebError:
+        raise
+    except Image.DecompressionBombError as exc:
+        raise WebError("image_too_large", 413, "Изображение содержит слишком много пикселей.") from exc
+    except Exception as exc:
+        raise WebError("invalid_image", 400, "Файл не читается как изображение.") from exc
+
+
+class _WorkerCompletion(asyncio.Future):
+    """Откладывает отмену ожидающей задачи до фактического завершения потока."""
+
+    def cancel(self, msg=None) -> bool:
+        return False
+
+
+async def _wait_for_worker(worker: asyncio.Future):
+    completion = _WorkerCompletion()
+    worker.add_done_callback(lambda _: completion.set_result(None))
+    try:
+        await completion
+    except asyncio.CancelledError as cancellation:
+        if not worker.cancelled():
+            try:
+                worker.result()
+            except Exception as failure:
+                cancellation.__cause__ = failure
+        raise
+    return worker.result()
+
+
+async def stage_image(file: UploadFile, workspace: TemporaryUploads) -> tuple[Path, str, str]:
+    staging = _ImageStaging(file, workspace)
+    loop = asyncio.get_running_loop()
+    worker = loop.run_in_executor(None, staging.run)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        staging.cancelled.set()
+        try:
+            with suppress(Exception):
+                await _wait_for_worker(worker)
+        finally:
+            # Поток уже остановлен; очистка покрывает и отмену после его успешного возврата.
+            cleanup = loop.run_in_executor(None, staging.cleanup)
+            await _wait_for_worker(cleanup)
         raise

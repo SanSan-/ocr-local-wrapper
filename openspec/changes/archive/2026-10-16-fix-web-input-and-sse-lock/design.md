@@ -1,8 +1,8 @@
 ## Context
 
 Причины и область описаны в [предложении](proposal.md); контракт — в [дельте local-web](specs/local-web/spec.md).
-Сохраняются общий сервис и владение задачами внутри веб-процесса по [ADR-001](../../context/ADR/ADR-001-shared-local-ocr.md)
-и [ADR-003](../../context/ADR/ADR-003-local-execution-and-model-lifecycle.md).
+Сохраняются общий сервис и владение задачами внутри веб-процесса по [ADR-001](../../../context/ADR/ADR-001-shared-local-ocr.md)
+и [ADR-003](../../../context/ADR/ADR-003-local-execution-and-model-lifecycle.md).
 
 ## Goals / Non-Goals
 

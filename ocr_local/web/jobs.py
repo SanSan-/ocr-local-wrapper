@@ -61,13 +61,14 @@ class JobRegistry:
     def cleanup(self) -> None:
         with self.lock:
             now = self.clock()
-            for job_id, job in list(self.jobs.items()):
-                if job.completed_at is not None and now - job.completed_at >= self.limits.job_ttl_seconds:
-                    for subscription in tuple(job.subscriptions):
-                        self.unsubscribe(subscription)
-                    self._clear_journal(job)
-                    job.terminal_event = None
-                    del self.jobs[job_id]
+            expired = [(job_id, job) for job_id, job in self.jobs.items()
+                       if job.completed_at is not None and now - job.completed_at >= self.limits.job_ttl_seconds]
+            for job_id, job in expired:
+                for subscription in tuple(job.subscriptions):
+                    self.unsubscribe(subscription)
+                self._clear_journal(job)
+                job.terminal_event = None
+                del self.jobs[job_id]
 
     def check_admission(self) -> None:
         self.cleanup()
@@ -109,7 +110,7 @@ class JobRegistry:
                 if not job.readers:
                     self._clear_journal(job)
                 job.options = job.reservation = job.thread = None
-            elif event.get("type") == "log" and job.completed_at is None:
+            elif event.get("type") == "log":
                 text = str(event.get("message", ""))
                 raw = text.encode("utf-8")
                 if len(raw) > self.limits.log_line_bytes:
@@ -194,6 +195,15 @@ class JobRegistry:
                 self._evict_oldest(job)
         return job.events.popleft() if job.events else None
 
+    def _next_payload(self, subscription: JobSubscription) -> tuple[bytes | None, bool]:
+        # Вызывается под замком реестра; строка учитывается до подтверждения отправки.
+        job = subscription.job
+        if subscription.drains_logs and (job.dropped or job.events):
+            payload = self._next_log(job)
+            subscription.in_flight = payload
+            return payload, False
+        return job.terminal_event, job.terminal_event is not None
+
     async def events(self, subscription: JobSubscription):
         job = subscription.job
         try:
@@ -204,13 +214,7 @@ class JobRegistry:
                         return
                     if subscription.in_flight is not None:
                         raise RuntimeError("Предыдущая строка журнала ещё не отправлена.")
-                    terminal = False
-                    if subscription.drains_logs and (job.dropped or job.events):
-                        payload = self._next_log(job)
-                        subscription.in_flight = payload
-                    else:
-                        payload = job.terminal_event
-                        terminal = payload is not None
+                    payload, terminal = self._next_payload(subscription)
                 yield b"data: " + payload + b"\n\n" if payload is not None else b": keep-alive\n\n"
                 waiting = payload is None
                 payload = None
@@ -251,7 +255,8 @@ class JobStreamResponse(StreamingResponse):
 
         try:
             await super().__call__(scope, receive, bounded_send)
-        except* (TimeoutError, OSError, ClientDisconnect):
+        except* (OSError, ClientDisconnect):
+            # Разрыв и тайм-аут отправки завершают поток; подписка освобождается в finally.
             pass
         finally:
             try:
